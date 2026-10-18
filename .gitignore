@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行时产物（模拟账本、事件库）不得进入版本控制
+*.db
+*.db-journal
+*.sqlite3
+var/
+runs/
