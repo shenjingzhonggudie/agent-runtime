@@ -9,6 +9,7 @@
 |---|---|
 | 当前里程碑 | 第 0 轮 / 骨架与工程检查 |
 | 已实现能力 | 可安装包、骨架冒烟测试、lint/格式检查、CI 配置（未远端运行） |
+| 进行中 | 模拟账本 `demo.Ledger`：方法签名与 12 个黑盒测试已就位，**实现为空（NotImplementedError）** |
 | 未实现能力 | 事件契约、reduce、工具注册与执行、策略、主循环、日志、恢复、对账、CLI |
 | 运行前提 | Windows + Python 3.14.6；离线，不依赖任何模型服务 |
 
@@ -23,9 +24,11 @@ v0 / v1 / v2 的定义与差异见 `LEARNING_LOG.md` 第 0 轮，不在本文件
 ├─ .gitignore
 ├─ .github/workflows/ci.yml  CI：安装 → ruff check → ruff format --check → pytest
 ├─ src/agentrun/
-│  └─ __init__.py            包入口，仅暴露 __version__ = "0.1.0.dev0"
+│  ├─ __init__.py            包入口，仅暴露 __version__ = "0.1.0.dev0"
+│  └─ demo.py                模拟账本（外部世界）占位：Ledger / Record / LedgerRejected
 └─ tests/
-   └─ test_package_smoke.py  2 个冒烟断言：可导入、版本非空
+   ├─ test_package_smoke.py  2 个冒烟断言：可导入、版本非空
+   └─ test_demo_ledger.py    12 个黑盒测试，当前全红（NotImplementedError）
 ```
 
 **故意不存在**：`events.py` / `model.py` / `tools.py` / `policy.py` / `engine.py` / `journal.py` / `trace.py` / `llm.py` / `demo.py` / `cli.py`。空目录或空文件不提供任何契约信息，等对应轮次真正需要时再创建。
