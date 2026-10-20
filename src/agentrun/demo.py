@@ -17,6 +17,7 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, cast
 
 _STATE_FILE = "ledger.json"
 _RESERVE = 300  # 转出后 src 的最低余额
@@ -27,6 +28,14 @@ class LedgerRejected(Exception):
 
     调用方可以把它当作“这笔操作一定没生效”的证据；与“调用结果未知”是两回事，
     后者不能仅凭异常类型判断。
+    """
+
+
+class LedgerCorrupted(Exception):
+    """账本存储内容不合法，读不出可信状态。
+
+    它与 ``LedgerRejected`` 必须分开：后者表示“确定没生效”，前者表示“现在既不
+    能断言生效，也不能断言未生效”。把它误当成“没生效”会直接导致重复副作用。
     """
 
 
@@ -75,22 +84,40 @@ class Ledger:
         if not self._path.exists():
             self._save({"balances": dict(initial or {}), "records": []})
 
-    def _load(self) -> dict:
-        """读取并返回 ``ledger.json`` 中的完整账本状态。
+    def _load(self) -> dict[str, Any]:
+        """读取并校验 ``ledger.json``，返回完整的账本状态。
 
         Returns:
-            dict: 包含两个键的状态字典：``"balances"``（账户名到余额的映射）和
-                ``"records"``（按生效顺序排列的操作记录列表，每项为 ``Record``
-                转成的字典）。
+            dict[str, Any]: 包含两个键的状态字典：``"balances"``（账户名到余额的
+                映射）和 ``"records"``（按生效顺序排列的操作记录列表，每项为
+                ``Record`` 转成的字典）。
+
+        Raises:
+            LedgerCorrupted: 文件不是合法 JSON、顶层不是对象，或 ``balances`` /
+                ``records`` 的类型不符。此时不能把账本当成“什么都没发生”。
 
         Notes:
             每次调用都从磁盘重新读取，不做缓存，因此总能看到最近一次成功落盘的
             内容。返回的是新对象，修改它不会影响磁盘；需要持久化时必须调用
-            ``_save``。
+            ``_save``。校验只覆盖读取所需的形状，字段级语义由调用方按需判断。
         """
-        return json.loads(self._path.read_text(encoding="utf-8"))
+        try:
+            raw: object = json.loads(self._path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise LedgerCorrupted(f"账本不是合法 JSON：{self._path}") from exc
+        if not isinstance(raw, dict):
+            raise LedgerCorrupted("账本顶层必须是对象")
+        balances = raw.get("balances")
+        records = raw.get("records")
+        if not isinstance(balances, dict) or not isinstance(records, list):
+            raise LedgerCorrupted("账本缺少 balances(对象) 或 records(数组)")
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in balances.values()
+        ):
+            raise LedgerCorrupted("balances 必须是从账户名到整数的映射")
+        return raw
 
-    def _save(self, state: dict) -> None:
+    def _save(self, state: dict[str, Any]) -> None:
         # 先写临时文件再原子替换：余额与记录要么一起可见，要么都不可见
         tmp = self._path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
@@ -108,10 +135,15 @@ class Ledger:
         Returns:
             int: 当前余额；未知账户视为 0。
 
+        Raises:
+            LedgerCorrupted: 账本文件不可读，或余额字段不是整数。此时不能假定
+                余额为 0——那会把“读不出来”误当成“没有钱”。
+
         Notes:
             只读操作，不产生记录、不改变账本，可以安全地重复调用。
         """
-        return self._load()["balances"].get(owner, 0)
+        # 余额类型已由 _load 校验（balances 的值必须是 int），这里只是告知类型检查器
+        return cast(int, self._load()["balances"].get(owner, 0))
 
     def transfer(
         self,
@@ -198,12 +230,22 @@ class Ledger:
         Returns:
             Record | None: 查到则返回对应记录；查不到返回 None。
 
+        Raises:
+            LedgerCorrupted: 记录项不是对象，或字段与 ``Record`` 不符。此时“查不到”
+                不能被当作“没生效”。
+
         Notes:
             None 只表示“此刻查不到”，**不等于**“该调用以后也不会生效”。延迟到达
             的请求、仍在执行的调用、尚未刷盘的写入，都可能让查询暂时落空。这个区
             别是后续对账与人工复核的判定基础。
         """
-        for r in self._load()["records"]:
-            if r["request_id"] == request_id:
-                return Record(**r)
+        for item in self._load()["records"]:
+            if not isinstance(item, dict):
+                raise LedgerCorrupted("账本记录项必须是对象")
+            try:
+                record = Record(**item)
+            except TypeError as exc:
+                raise LedgerCorrupted(f"账本记录字段不符：{item!r}") from exc
+            if record.request_id == request_id:
+                return record
         return None

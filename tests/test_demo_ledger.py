@@ -4,9 +4,11 @@
 每个测试都自己开账本，互不共享目录。
 """
 
+import json
+
 import pytest
 
-from agentrun.demo import Ledger, LedgerRejected
+from agentrun.demo import Ledger, LedgerCorrupted, LedgerRejected
 
 ALICE = "alice"
 BOB = "bob"
@@ -98,6 +100,35 @@ def test_lookup_finds_transfer(tmp_path) -> None:
     assert record is not None
     assert record.kind == "transfer"
     assert (record.src, record.dst, record.amount) == (ALICE, BOB, 250)
+
+
+def test_corrupted_json_is_not_treated_as_empty(tmp_path) -> None:
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "ledger.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(LedgerCorrupted):
+        Ledger(root).balance(ALICE)
+
+
+def test_non_integer_balance_is_rejected(tmp_path) -> None:
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "ledger.json").write_text(
+        json.dumps({"balances": {ALICE: "1000"}, "records": []}), encoding="utf-8"
+    )
+
+    with pytest.raises(LedgerCorrupted):
+        Ledger(root).balance(ALICE)
+
+
+def test_missing_state_keys_are_rejected(tmp_path) -> None:
+    root = tmp_path / "world"
+    root.mkdir()
+    (root / "ledger.json").write_text(json.dumps({"balances": {}}), encoding="utf-8")
+
+    with pytest.raises(LedgerCorrupted):
+        Ledger(root).balance(ALICE)
 
 
 def test_rejected_then_accepted_uses_new_request_id(tmp_path) -> None:
