@@ -1,4 +1,4 @@
 {
-  "foldOnOpen.targets": ["AllBlockComments", "AllMarkerRegions"],
+  "foldOnOpen.targets": ["Level3"],
   "foldOnOpen.enableFiles": ["src/**/*.py", "tests/**/*.py"]
 }
