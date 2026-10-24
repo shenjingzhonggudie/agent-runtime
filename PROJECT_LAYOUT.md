@@ -7,9 +7,9 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 2 轮完成（工具执行），下一步第 3 轮（最小 Agent 循环） |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠（apply / replay）、工具协议与单次执行、lint + 格式 + mypy + CI 配置 |
-| 未实现能力 | 策略、主循环、持久化日志、恢复、对账、追踪、CLI、真实模型、账本工具适配器 |
+| 当前里程碑 | 第 3 轮进行中：3A（引擎循环）完成；3B（账本工具 + 演示）待做 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算 |
+| 未实现能力 | 持久化日志、恢复、对账、追踪、CLI、真实模型、账本工具适配器 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -29,12 +29,18 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
 │  ├─ events.py              事件契约：EventType / Event / make_step_key
 │  ├─ model.py               RunStatus / Outcome / InvalidEvent / StepView / RunView / apply / replay
-│  └─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolRegistry / run_tool
+│  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolRegistry / run_tool
+│  ├─ journal.py             EventLog 协议 + MemoryEventLog（分配 seq）
+│  ├─ policy.py              ToolCall / Finish / Policy 协议 / ScriptedPolicy
+│  └─ engine.py              StopReason / EngineResult / Engine（循环、预算、终止）
 └─ tests/
    ├─ test_package_smoke.py  2 个冒烟断言
    ├─ test_demo_ledger.py    15 个账本测试
    ├─ test_model_contract.py 26 个事件折叠契约测试
-   └─ test_tools_contract.py 14 个工具执行测试（含计数 Fake 工具）
+   ├─ test_tools_contract.py 14 个工具执行测试（含计数 Fake 工具）
+   ├─ test_journal_contract.py 4 个内存日志测试
+   ├─ test_policy_contract.py  4 个策略测试
+   └─ test_engine_contract.py 10 个引擎契约测试
 ```
 
 **故意不存在**：`tools.py` / `policy.py` / `engine.py` / `journal.py` / `trace.py` / `llm.py` / `cli.py`。
@@ -161,10 +167,10 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 - 时间：2026-10-20（第 2 轮结束）
 - 命令与结果：
-  - `pytest` → `57 passed in 1.93s`
+  - `pytest` → `75 passed in 0.81s`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `13 files already formatted`
-  - `mypy` → `Success: no issues found in 5 source files`
+  - `ruff format --check .` → `19 files already formatted`
+  - `mypy` → `Success: no issues found in 8 source files`
 - 未验证：CI 远端运行、真实模型、持久化、恢复、并发
 
 ### 历史环境事件
