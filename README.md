@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第 15 轮完成：日志读侧会验真，账本读改写有跨进程互斥。
+第 16 轮完成：租约会被主动归还，`status` 能看见谁占着任务。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -31,6 +31,7 @@
 - `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
 - 日志读侧验真：缺号、末尾被删、事件归属别的 `run_id` 一律抛 `JournalCorrupted`，不返回残缺序列；两次 SELECT 在同一个只读事务里，不会被并发写者插队。
 - 账本所有公开方法都在 `ledger.lock` 的跨进程独占锁里完成读改写；拿不到锁抛 `LedgerBusy`（**确定未生效**），工具层映射成「业务拒绝」而不是「结果未知」。锁由内核持有，进程被杀即释放。
+- 一次 `run` / `resume` 结束时（成功、失败、耗尽、未知、失联都算）归还租约：干净退出的任务下一个 worker 立刻能接手，只有崩溃才等 TTL。`status` 会打印租约持有者与剩余时间，过期则标「可被接管」。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 

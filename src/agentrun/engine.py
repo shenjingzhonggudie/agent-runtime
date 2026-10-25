@@ -80,6 +80,10 @@ class Engine:
     Notes:
         ``owner=None`` 时完全退化为 v1 的单 worker 行为：不取租约、不校验栅栏。
         这是刻意的——单进程演示不该被并发语义拖慢。
+
+        一次 ``run`` / ``resume`` 结束时（无论成功、失败、耗尽、未知还是失联）都会
+        在 ``finally`` 里归还租约；因此「干净退出」的任务下一个 worker 可以立刻接手，
+        只有进程崩溃才需要等 TTL。
     """
 
     def __init__(
@@ -115,7 +119,12 @@ class Engine:
         Notes:
             每次写入前先续租：工具调用可能耗时，靠「开始时取一次」撑不到最后。续租
             与写入之间仍有窗口，所以真正的保护在日志的栅栏校验——续租只是把窗口缩小。
+
+            租约归还之后再写一律 ``LeaseLost``：那时 ``runs.owner`` 已是空，日志不会
+            替你拦，只能由引擎自己守住这条线。
         """
+        if self._owner is not None and self._lease is None:
+            raise LeaseLost(f"{run_id!r} 的租约已归还，不能再写")
         if self._lease is None:
             return self._log.append(run_id, type_, payload)
         self._lease = self._log.renew(self._lease, self._lease_ttl)
@@ -133,6 +142,28 @@ class Engine:
         if lease is None:
             raise LeaseBusy(f"{run_id!r} 的租约被其他 worker 占用")
         self._lease = lease
+
+    def _release(self) -> None:
+        """把租约还给日志；没启用租约、或已经归还时什么也不做。
+
+        Raises:
+            无。归还失败被当作"别人要多等一会儿"，不改变任务结局。
+
+        Notes:
+            只在收尾时调用。归还是**主动**让位：干净结束的任务不必等 TTL 过期，下一个
+            worker 立刻能接手。被接管后再归还属于无操作（owner / epoch 已经不匹配），
+            所以这里吞掉 ``LeaseLost``——它只是说明"这本来就是别人的东西"。
+
+            进程崩溃时走不到这里，TTL 仍然是唯一的兜底：主动归还与超时接管是两条
+            互补的路径，缺一条就会"干净退出也要等 30 秒"。
+        """
+        lease, self._lease = self._lease, None
+        if lease is None:
+            return
+        try:
+            self._log.release(lease)
+        except LeaseLost:
+            return
 
     def _view(self, run_id: str) -> RunView:
         """从日志重放当前视图。
@@ -172,6 +203,8 @@ class Engine:
             if not events:
                 raise
             return EngineResult(view=replay(events), stop_reason=StopReason.LOST)
+        finally:
+            self._release()
 
     def resume(self, run_id: str) -> EngineResult:
         """在已有日志上继续执行。
@@ -236,6 +269,8 @@ class Engine:
             return self._drive(run_id, view.max_steps)
         except LeaseLost:
             return EngineResult(view=self._view(run_id), stop_reason=StopReason.LOST)
+        finally:
+            self._release()
 
     def _execute(
         self,

@@ -20,13 +20,14 @@
 
 import argparse
 import json
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from .demo import Ledger
 from .engine import Engine, NothingToResume, StopReason
-from .journal import JournalCorrupted, LeaseBusy, SqliteEventLog
+from .journal import JournalCorrupted, Lease, LeaseBusy, SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
 from .model import REVIEW_DECISIONS, InvalidEvent, RunView, replay
 from .policy import Action, Finish, ScriptedPolicy, ToolCall
@@ -186,6 +187,26 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return exit_code_for(result.stop_reason)
 
 
+def print_lease(lease: Lease | None) -> None:
+    """打印租约现状：谁持有、还剩多久、是否已经过期。
+
+    Args:
+        lease: 当前登记的租约；``None`` 表示无人持有。
+
+    Notes:
+        「已过期」只表示此刻可以被接管，不表示对方一定已经停下——它可能只是慢。
+        把这句话写死在输出里，是为了避免有人看到"过期"就以为"没人干活"。
+    """
+    if lease is None:
+        print("租约：无人持有")
+        return
+    remaining = lease.expires_at - time.time()
+    if remaining > 0:
+        print(f"租约：{lease.owner}（epoch {lease.epoch}），剩 {remaining:.1f} 秒")
+    else:
+        print(f"租约：{lease.owner}（epoch {lease.epoch}），已过期（可被接管）")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """执行 ``status`` 子命令。"""
     log = SqliteEventLog(args.db)
@@ -196,6 +217,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     for event in events:
         print(f"{event.seq:>3}  {event.type}")
     print()
+    print_lease(log.lease_of(args.run_id))
     print_view(replay(events))
     return 0
 

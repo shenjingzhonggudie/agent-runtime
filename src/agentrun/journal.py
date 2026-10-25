@@ -94,6 +94,15 @@ class EventLog(Protocol):
         """按 ``seq`` 升序返回该任务的全部事件；未知任务返回空元组。"""
         ...
 
+    def lease_of(self, run_id: str) -> Lease | None:
+        """返回当前登记的租约；无人持有返回 ``None``。
+
+        Returns:
+            Lease | None: 可能已过期——过期的租约仍会返回，由调用方判断"现在能不能
+            被接管"，因为"过期"与"没人"在排障时是两件事。
+        """
+        ...
+
     def acquire(self, run_id: str, owner: str, ttl: float) -> Lease | None:
         """尝试取得租约；被别人占用时返回 ``None``，同一 owner 续用原 epoch。"""
         ...
@@ -188,6 +197,21 @@ class MemoryEventLog:
                     f"{run_id!r} 的事件序号不连续：第 {index} 条记录的 seq 为 {event.seq}"
                 )
         return events
+
+    def lease_of(self, run_id: str) -> Lease | None:
+        """返回当前登记的租约；无人持有返回 ``None``。
+
+        Args:
+            run_id: 任务标识。
+
+        Returns:
+            Lease | None: 持有者与到期时刻；可能已经过期（调用方自己判断能否接管）。
+
+        Notes:
+            只读、不加锁、不改状态。``release`` 之后这里是 ``None``——排障时"没人持有"
+            与"有人但过期了"必须能分开看。
+        """
+        return self._leases.get(run_id)
 
     def acquire(self, run_id: str, owner: str, ttl: float) -> Lease | None:
         """取得或续用租约。
@@ -460,6 +484,30 @@ class SqliteEventLog:
                 f"{run_id!r} 的 last_seq 为 {last_seq}，实际只读到 {len(events)} 条事件"
             )
         return tuple(events)
+
+    def lease_of(self, run_id: str) -> Lease | None:
+        """返回当前登记的租约；无人持有返回 ``None``。
+
+        Args:
+            run_id: 任务标识。
+
+        Returns:
+            Lease | None: 持有者与到期时刻；可能已经过期（调用方自己判断能否接管）。
+
+        Notes:
+            与 ``acquire`` 不同，这里不加锁、不改状态，也不判断过期：排障时"没人持有"
+            与"有人但过期了"是两件事，后者说明对方可能已经崩了。
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT owner, epoch, lease_expires_at FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or row[0] is None or row[2] is None:
+            return None
+        return Lease(run_id, str(row[0]), int(row[1]), float(row[2]))
 
     def acquire(self, run_id: str, owner: str, ttl: float) -> Lease | None:
         """取得或续用租约。

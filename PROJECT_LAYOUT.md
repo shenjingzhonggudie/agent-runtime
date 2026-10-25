@@ -7,8 +7,8 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 15 轮完成：账本跨进程互斥，读改写不再丢更新 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 当前里程碑 | 第 16 轮完成：租约主动归还，`status` 能看见谁占着任务 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
 | 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
@@ -69,7 +69,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_reconcile.py         对账：查到才补记、查不到提交复核、补记后可续跑
    ├─ test_review.py            复核：暂停态、三种结论、重复复核、续跑闸门
    ├─ test_process_crash.py     进程级：三个窗口真退进程后由新进程恢复
-   ├─ test_lease.py             租约：epoch、续租、过期、栅栏拒写、引擎失联
+   ├─ test_lease.py             租约：epoch、续租、过期、栅栏拒写、引擎失联、归还与可见性
    ├─ test_journal_integrity.py 完整性：缺号、缺尾、跨 run 混入、CLI 报告损坏
    ├─ test_ledger_concurrency.py 账本并发：两进程不丢更新、忙时零副作用、被杀后自释放
    ├─ test_process_takeover.py  接管：两个真实进程，旧 worker 醒来写入被拒
@@ -218,6 +218,7 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 | `Lease` | — | 冻结 dataclass | `run_id / owner / epoch / expires_at`；epoch 是接管代数 |
 | `LeaseLost` | — | 异常 | 写入被拒：被接管、非持有者，或从未持有。**这次写入没有发生** |
 | `LeaseBusy` | — | 异常 | 开始工作前就发现租约在别人手里 |
+| `lease_of(run_id)` | 任务标识 | `Lease \| None` | 只读快照：谁持有、何时到期；**不判断过期**，过期也会返回 |
 | `JournalCorrupted` | — | 异常 | 序列不自洽：缺号、`last_seq` 与实际条数不符、事件归属别的 `run_id`、有事件无元数据 |
 | `MemoryEventLog` | — | 实例 | 内存实现，仅用于测试与单进程 |
 | `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化与租约；构造时不连接、不建表 |
@@ -289,6 +290,14 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 `StopReason.LOST`，任务状态不变（`LOST` 是这个 worker 的结局，不是任务的）。
 `owner=None` 完全退化为单 worker：不取租约、不校验栅栏。
 
+**归还**：`run` / `resume` 的 `finally` 里调 `_release()`，无论成功、失败、耗尽、
+未知还是失联，收尾都把租约还回去。归还是**主动让位**——干净结束的任务下一个 worker
+立刻能接手；进程崩溃走不到这里，TTL 才是那条路径的兜底。归还失败（已经被接管）属于
+无操作，不改变任务的结局，只影响「别人要多等多久」。
+
+归还之后 `self._lease` 为空，而日志侧 `runs.owner` 也已被清空——栅栏此时不再拦任何
+写入，所以引擎自己在 `_append` 里守住一条：**有 owner 却没有租约 → `LeaseLost`**。
+
 ### 3.9 对账与人工复核（`reconcile.py`）
 
 | 接口 | 输入 | 输出 | 说明 |
@@ -333,7 +342,7 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 |---|---|---|
 | `run` | `--run-id --script [--task] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或失联 / 2 参数、脚本或租约忙 |
 | `resume` | `--run-id --script [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
-| `status` | `--run-id` | 0 / 任务不存在时 2 |
+| `status` | `--run-id` | 0 / 任务不存在时 2；额外打印租约持有者与剩余时间 |
 | `reconcile` | `--run-id` | 0 已补记或已提交复核 / 2 查询失败或无需对账 |
 | `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON]` | 0 已写入 / 2 没有待复核或参数错 |
 
@@ -501,12 +510,14 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D51 | 账本互斥放在哪一层 | 账本自己（`ledger_lock`），不放到引擎或工具层 | 2026-10-25 | 只有账本知道「一次业务由哪几步组成」；放到工具层，「读余额 → 转账」这种跨调用业务仍然不原子。代价是账本成为串行点 |
 | D52 | 拿不到账本锁的语义 | `LedgerBusy` → `ToolRejected`（`rejected`），不是 `UNCERTAIN` | 2026-10-25 | 锁在读写之前取得，没拿到就什么都没做；记成「可能已生效」会凭空造出一场对账和人工复核。前提是「取得锁早于任何副作用」，将来加缓存写入必须重新审这条 |
 | D53 | 只读是否排队 | 排队：`balance` / `lookup` 也取锁 | 2026-10-25 | Windows 上 `os.replace` 与「别人正打开目标文件」冲突，实测会抛 `WinError 32`，而它会被 `run_tool` 归成 `UNCERTAIN`——把「确定没生效」抬成「可能已生效」。代价是读吞吐下降 |
+| D54 | 归还租约的时机 | `run` / `resume` 的 `finally`，任何结局都归还 | 2026-10-25 | 干净退出不该让下一个 worker 等满 TTL；放在 `finally` 才不会漏掉 `LOST` 与异常分支。代价是同一 owner 每次 run 都会换 epoch |
+| D55 | 过期租约怎么展示 | `status` 显示持有者与剩余时间；过期标「可被接管」，但**不自动接管** | 2026-10-25 | 运维需要「谁占着」这个事实；「过期」只说明此刻可以接管，不说明对方已经停下。系统不替人做接管决定 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 302 passed（连跑 6 遍无偶发失败） |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 310 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
 | ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
@@ -518,17 +529,17 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 15 轮完成）
+- 时间：2026-10-25（第 16 轮完成）
 - 命令与结果：
-  - `pytest` → `302 passed`（新增 6 例：丢更新、忙时零副作用、被杀后锁释放、工具映射、
-    并发读不误报）
+  - `pytest` → `310 passed`（新增 8 例：归还后的接手、UNCERTAIN 也归还、被接管不越权、
+    归还失败不改结局、归还后禁写、`lease_of`、`status` 两态输出）
   - `ruff check .` → `All checks passed!`
   - `ruff format --check .` → `54 files already formatted`
   - `mypy` → `Success: no issues found in 15 source files`
-  - `tests/test_ledger_concurrency.py` → 两个进程各 20 笔：修前一方报
-    `PermissionError WinError 32`、账本只记 20 笔；修后 40 笔全记，余额 600/400
-  - `scripts/_probe_ledger_race.py` → 两进程 × 20 笔，`balance=600/400 transfers=40`
-  - `python scripts/eval_suite.py` → `8/8 通过`（195 ms）
+  - 修前证据：新增用例里 `test_finished_run_gives_the_lease_back` 与
+    `test_uncertain_stop_gives_the_lease_back` 报 `assert None is not None`——任务已结束，
+    另一个 owner 仍拿不到租约，必须等满 TTL
+  - `python scripts/eval_suite.py` → `8/8 通过`
 - 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电、账本锁的 POSIX 分支
 
 ### 第 4 轮新增证据
@@ -571,6 +582,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 账本锁的 POSIX 分支未验证 | `fcntl.flock` 那段代码本机跑不到，行为只按文档推断 | 在 Linux / macOS 上运行或 CI 加矩阵时 |
 | 账本锁是整文件粒度 | 两个不同账户的转账也互相排队；写操作等锁上限 5s | 账户数或并发度上升时 |
 | 账本锁只对同机进程有效 | NFS / SMB 上的文件锁语义不一，可能退化为不互斥 | 账本放到共享存储时 |
+| 租约状态只在查看时可见 | `status` 是一次快照，没有「即将过期」的告警通道；过期后也不会自动通知任何人 | 接入运维告警或多任务调度时 |
+| 归还只覆盖「走到 finally」的路径 | 进程在归还前被杀，仍要走 TTL；没有「退出前写遗嘱」这类机制 | 需要更快接管时 |
 | CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
 | Docker 未引入 | 无容器化交付 | CLI 稳定 + 跨机需求 |
 
