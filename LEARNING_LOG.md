@@ -1200,3 +1200,63 @@
      `read` 全量扫描、账本锁 POSIX 分支未验证。
 
 - **本轮状态**：实现与验证完成；**复盘待进行**。
+
+## 第 17 轮：远端仓库与 CI 实跑
+
+- **本轮目标与架构位置**：把仓库推到 GitHub，让流水线真正跑一次。工作区之外的两笔债
+  ——「CI 未远端运行」与「账本锁 POSIX 分支未验证」——本质是同一个问题：配置存在，
+  但从没被执行过。
+
+- **做了什么**：`git remote add origin` → `push -u origin main`（首次推送成功，58 个
+  文件、0.5 MB）→ CI 触发 → **Type check 失败** → 定位到一行注解 → 删掉 → 再推 →
+  全绿（310 个用例在 Linux 上跑通）。
+
+- **遇到的问题与最小复现**：
+  1. 同一个 `mypy` 命令，本地 15 files 0 error，CI 红在同一步。原因不是逻辑，是平台：
+     `demo.py` 里 `sys.platform == "win32"` 的 `else` 分支在 Windows 上被 mypy **裁剪**，
+     `import fcntl  # type: ignore[import-not-found]` 那一行从未被分析，所以本地既不会
+     报"找不到模块"，也不会报"忽略多余"；到了 Ubuntu，该行变成活代码、模块真实存在，
+     `warn_unused_ignores` 立刻判定忽略是多余的——**多余本身就是错误**。
+  2. 首次推送要"干净"，前提是远端仓库为空（`git ls-remote --heads` 无输出）。如果
+     建库时勾了 README / .gitignore / license，远端会先有一个提交，`push` 变成
+     non-fast-forward，必须 `pull --rebase` 再推。
+  3. 环境里没有 `gh` CLI，仓库需要在网页上建；推送靠系统级 Git Credential Manager。
+
+- **验证命令、结果与证据**：
+  - 首次：Actions run `40188948999` → `failure`，失败步骤 `Type check`（lint、format 通过，
+    `pytest` 被跳过）
+  - 修正后：run `40189098128` → `success`（`ruff check` / `ruff format --check` /
+    `mypy` / `pytest` 全过）
+  - 本地：`pytest` 310 passed、`mypy` 15 files、`ruff` 通过 54 files
+  - 顺带完成的事：`fcntl.flock` 分支第一次被真实执行——之前它一直是"按文档推断"
+
+- **根因与可迁移规律**：
+  1. 「本地全绿」只覆盖本地平台。平台分支是测试覆盖的盲区，CI 是唯一能证明它的那只
+     眼睛；不推上去，"支持 Linux"这句话就没有证据。
+  2. `type: ignore` 是**带平台的债务**：它在 A 平台必要、在 B 平台多余，而"多余"在
+     `warn_unused_ignores` 下就是错误。写法上要么两平台都成立，要么干脆不要那条分支
+     （例如把平台差异收进单文件、用 importlib 统一入口）。
+  3. 「配置存在」与「流水线跑过」差一个证据。`.github/workflows/ci.yml` 写了十几天，
+     真正有价值的是那一次 `success`。
+
+- **架构问题（学习者先答，Agent 不附答案）**：
+  1. CI 现在只在 ubuntu 上跑。Windows 本地通过的 310 个用例里，有一批依赖 `msvcrt`
+     的锁语义与 `os.replace` 在文件被占用时的行为。若加 Windows 矩阵，你认为哪一类
+     用例最可能先露馅？为什么？
+  2. 这次失败暴露的是"注解的平台差异"，不是逻辑缺陷。怎样让这类"只在某个平台才成立
+     （或才多余）"的东西不再靠人记？mypy 有平台参数、CI 可加矩阵、也可以干脆消除
+     平台分支——三条路各自把成本推给了谁？
+
+- **学习者原回答摘要**：未答题。**复盘题累积 30 道**。
+
+- **纠偏**：实现部分仍由 Agent 完成，但仓库创建与授权是学习者做的。CI 矩阵目前只有
+  单平台，macOS 完全没跑过。
+
+- **债务**：
+  1. CI 只有 ubuntu 单平台矩阵：Windows 的锁语义与文件替换行为不在流水线里。
+  2. macOS 未验证（`fcntl` 在 macOS 与 Linux 的语义也不完全一致）。
+  3. 前几轮遗留：账本状态文件无格式版本号、Docker 未触发、TTL 与写入耗时的余量未
+     自检、`LeaseLost` 未区分自失与接管、完整性校验无密码学证据、`read` 全量扫描、
+     租约状态无告警通道、归还只覆盖走到 `finally` 的路径。
+
+- **本轮状态**：完成；**复盘待进行**。

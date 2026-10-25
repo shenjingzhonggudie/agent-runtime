@@ -1,5 +1,7 @@
 # Agent 任务执行引擎（agentrun）
 
+[![CI](https://github.com/shenjingzhonggudie/agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/shenjingzhonggudie/agent-runtime/actions/workflows/ci.yml)
+
 以持久化事件为事实来源、根据工具反馈决定下一步动作、并能在明确安全边界内恢复的轻量 Agent 执行引擎。
 
 默认场景为隔离目录中的**模拟账本**（余额查询、非幂等转移、幂等回执、按调用标识对账），不连接任何真实支付、银行或邮件系统。

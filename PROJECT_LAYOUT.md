@@ -7,7 +7,7 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 16 轮完成：租约主动归还，`status` 能看见谁占着任务 |
+| 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
 | 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
 | 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
@@ -521,7 +521,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
 | ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
-| CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
+| CI | GitHub Actions，ubuntu-latest + Python 3.14 | 同上四条 | **已推送并实跑通过**（run 40189098128） |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
 mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores`、
@@ -529,7 +529,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 16 轮完成）
+- 时间：2026-10-25（第 17 轮完成：远端仓库 + CI 实跑）
 - 命令与结果：
   - `pytest` → `310 passed`（新增 8 例：归还后的接手、UNCERTAIN 也归还、被接管不越权、
     归还失败不改结局、归还后禁写、`lease_of`、`status` 两态输出）
@@ -540,7 +540,10 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
     `test_uncertain_stop_gives_the_lease_back` 报 `assert None is not None`——任务已结束，
     另一个 owner 仍拿不到租约，必须等满 TTL
   - `python scripts/eval_suite.py` → `8/8 通过`
-- 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电、账本锁的 POSIX 分支
+  - GitHub Actions（ubuntu-latest + Python 3.14）→ 首次运行 `failure`（Type check：
+    `demo.py` 里 `import fcntl` 上挂着多余的 `type: ignore`）；删掉忽略后第二轮
+    `success`，310 个用例在 Linux 上全过，`fcntl.flock` 分支第一次被真实执行
+- 未验证：真实模型服务、跨机器时钟、`kill -9` 与断电、macOS
 
 ### 第 4 轮新增证据
 
@@ -579,12 +582,11 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
 | CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
-| 账本锁的 POSIX 分支未验证 | `fcntl.flock` 那段代码本机跑不到，行为只按文档推断 | 在 Linux / macOS 上运行或 CI 加矩阵时 |
+| 账本锁只被 Linux（CI）与 Windows（本机）验证过 | macOS 未跑；`fcntl` 在 Linux 上的语义与 macOS 也不完全一致 | 声称支持 macOS 时 |
 | 账本锁是整文件粒度 | 两个不同账户的转账也互相排队；写操作等锁上限 5s | 账户数或并发度上升时 |
 | 账本锁只对同机进程有效 | NFS / SMB 上的文件锁语义不一，可能退化为不互斥 | 账本放到共享存储时 |
 | 租约状态只在查看时可见 | `status` 是一次快照，没有「即将过期」的告警通道；过期后也不会自动通知任何人 | 接入运维告警或多任务调度时 |
 | 归还只覆盖「走到 finally」的路径 | 进程在归还前被杀，仍要走 TTL；没有「退出前写遗嘱」这类机制 | 需要更快接管时 |
-| CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
 | Docker 未引入 | 无容器化交付 | CLI 稳定 + 跨机需求 |
 
 ## 9. 未来模块（未创建）
