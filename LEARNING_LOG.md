@@ -402,3 +402,76 @@
      CI 未远端运行、Docker 未触发。
 
 - **本轮状态**：实现与验证完成；**复盘待进行**。
+
+## 第 6 轮：续跑、对账与 CLI
+
+- **本轮目标与架构位置**：把“日志里存着事实”变成“能从事实接着走”。三个新件：
+  `Engine.resume`（引擎侧的续跑入口）、`reconcile.py`（把悬空步骤补记成确定）、
+  `cli.py`（把模块组装成命令）。`journal`、`model`、`tools` 一行未改。
+
+- **已确认的契约 / 决策，以及学习者的理由**：
+  - D25 续跑预算取 `view.max_steps`、D26 续跑终态任务返回视图而不抛异常、
+    D27 CLI 读 JSON 脚本 + 标准库 `argparse`。学习者回复“全部由你完成”，未逐条给理由。
+
+- **学习者的手工推演**：本轮未做。
+
+- **遇到的问题与最小复现**：
+  1. `Engine.run` 无条件追加 `RUN_STARTED`，导致已有日志无法续跑（`model.apply` 会拒绝
+     第二条 `RUN_STARTED`）。修法是把主循环抽成 `_drive(run_id, max_steps)`，`run` 只负责
+     写首条事件。既有的 159 个测试全部仍绿，说明抽取没有改变契约。
+  2. `resume` 遇到「最后一步 `STEP_STARTED` 但没有结果」时若直接进入主循环，
+     `policy.decide` 会按 `len(view.steps)` 取下一个动作，**那一步被永久跳过**。改为在
+     `resume` 入口就返回 `UNCERTAIN`，一步也不执行。
+  3. CLI 测试里给 `status` 传了 `--ledger`，`argparse` 直接 `SystemExit: 2`
+     （`unrecognized arguments`）。`status` 不接账本参数，测试需分开构造参数。
+  4. `ScriptedPolicy` 的索引是 `len(view.steps)`。对账补记之后步数变成 1，续跑会取
+     `script[1]`；测试第一次只给了单元素脚本，于是 `ScriptExhausted`。这暴露了一个真实
+     约束：**续跑提供的脚本必须与原脚本按步号对齐**，否则行为整体偏移一位。
+  5. PowerShell 的 `Out-File -Encoding utf8` 在 5.1 会写 BOM，`json.loads` 读带 BOM 的
+     文本会报 `Expecting value`。改用 `utf-8-sig` 读取，两种写法都能读。
+
+- **最初假设 / Agent 是否误判**：
+  - 误判：设计 `status` 子命令时以为“所有子命令都该接受 `--db` 和 `--ledger`”。
+    实际上 `status` 只读日志，多一个参数就多一条错误路径。
+  - 未误判：`reconcile` 只补记成功、不为 `found=False` 写任何事件，这个保守取舍与
+    第 3 轮定下的「`None` 只表示此刻查不到」完全一致，没有在实现阶段被简化掉。
+
+- **验证命令、结果与证据**：
+  - `pytest` → `183 passed`
+  - `mypy` → `Success: no issues found in 12 source files`
+  - `ruff check .` → `All checks passed!`；`ruff format --check .` → `31 files already formatted`
+  - `python scripts/reconcile_demo.py` → 退出码 0。崩溃现场 3 条事件 → 首次 `resume`
+    返回 `UNCERTAIN` 且余额保持 `750/250` → 对账补记 step 1 → 再次 `resume` 跑完 8 条事件，
+    最终余额仍是 `750/250`
+  - `python -m agentrun.cli run` + `status` → 退出码 0，5 条事件，状态 `SUCCEEDED`
+
+- **根因与可迁移规律**：
+  1. 「恢复」不是「重跑」。`resume` 的第一件事是判断“能不能接着跑”，而不是直接进入循环；
+     判断错了，`steps` 的索引会让程序在不报错的情况下跳过一步。
+  2. 补记的语义是**用外部世界的事实回填日志**，不是重放调用。因此补记的 `result` 与原始
+     返回值不保证同构——凡是下游依赖 `result` 内部字段的逻辑，都要接受这一点。
+  3. CLI 的参数是 API。给不需要账本的子命令加 `--ledger`，代价是使用者多一条会失败的路径。
+
+- **架构问题（学习者先答，Agent 不附答案）**：
+  1. 若某个任务在第 1 步就 `RUN_EXHAUSTED`，此时 `resume` 会走哪条分支？返回什么状态？
+     这个行为符合“预算属于任务”的设定吗？
+  2. `reconcile` 补记的 `result` 来自账本记录（`found` / `kind` / `amount`），不是
+     `Transfer.run` 原本的返回值（`request_id` / `src` / `dst` / `amount`）。如果下游有逻辑
+     读取 `result["src"]`，补记之后会发生什么？
+
+- **学习者原回答摘要**：本轮未答题。**复盘题累积 8 道**（第 3 轮 2、第 4 轮 2、第 5 轮 2、
+  第 6 轮 2）。
+
+- **纠偏与仍未理解的部分**：第 6 轮全部实现仍由 Agent 完成。到这一轮为止，学习者已经
+  连续四轮没有亲手写业务代码，也连续四轮没有答题；「能读懂」与「能写对」之间的差距仍未
+  被验证。下次交互建议先做一次不看答案的重写（任选 `Engine.resume` 或 `reconcile`）。
+
+- **债务**：
+  1. `reconcile` 只能补记成功，没有判定“确实没生效”的证据来源 → 需要人工判定时。
+  2. 策略不持久化，`resume` 必须重新提供一致的脚本 → 第 8 轮模型策略。
+  3. `codec` 不校验 payload 的业务字段 → 第 7 轮写入前的最后校验。
+  4. `lookup` 不区分记录类型 → 需要区分 transfer / receipt 时。
+  5. 前几轮遗留：`args` 共享引用、`RUN_FAILED` 原因未进视图、`replay` 信任顺序、
+     账本无版本号、读改写无锁、CI 未远端运行、Docker 未触发。
+
+- **本轮状态**：实现与验证完成；**复盘待进行**。

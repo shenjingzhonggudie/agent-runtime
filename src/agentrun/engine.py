@@ -12,7 +12,7 @@ from enum import StrEnum
 
 from .events import EventType, make_step_key
 from .journal import EventLog
-from .model import RunView, replay
+from .model import RunStatus, RunView, replay
 from .policy import Finish, Policy
 from .tools import ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
 
@@ -28,6 +28,14 @@ class StopReason(StrEnum):
     FAILED = "FAILED"
     EXHAUSTED = "EXHAUSTED"
     UNCERTAIN = "UNCERTAIN"
+
+
+class NothingToResume(Exception):
+    """日志里没有该任务的任何事件，无法续跑。
+
+    抛出它表示调用方给错了 ``run_id``，而不是「任务已经跑完了」。已经跑完的任务
+    走 ``Engine.resume`` 会正常返回现有视图，不会抛它。
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +89,62 @@ class Engine:
             InvalidEvent: 事件序列非法（属于编程错误，不应在正常运行中出现）。
 
         Notes:
+            只负责写 ``RUN_STARTED``，随后把控制权交给 ``_drive``。同一个 ``run_id``
+            重复调用会再写一条 ``RUN_STARTED``，而 ``model.apply`` 会拒绝它——要接着
+            上次的进度继续，请用 ``resume``。
+        """
+        self._log.append(run_id, EventType.RUN_STARTED, {"task": task, "max_steps": max_steps})
+        return self._drive(run_id, max_steps)
+
+    def resume(self, run_id: str) -> EngineResult:
+        """在已有日志上继续执行。
+
+        Args:
+            run_id: 已存在于日志中的任务标识。
+
+        Returns:
+            EngineResult: 停止时的视图与原因。预算取 ``view.max_steps``，即任务自己
+            的预算，不接收新的预算参数。
+
+        Raises:
+            NothingToResume: 日志里没有该任务的任何事件。
+            InvalidEvent: 日志内容非法（编程错误或存储损坏，不应在正常运行中出现）。
+
+        Notes:
+            三种停止情形，都不追加任何事件：
+
+            1. 视图已是终态 → 原样返回，``stop_reason`` 由状态推出。
+            2. 最后一步已 ``STEP_STARTED`` 但没有结果 → 返回 ``UNCERTAIN``。外部世界
+               可能已经改变，既不能重做也不能跳过，必须先用对账补记结果。
+            3. 其余情况 → 交给 ``_drive`` 继续。
+
+            第 2 条是这一层最重要的判断：宁可停着不动，也不用“重试一次看看”去赌一个
+            非幂等调用没有生效。
+        """
+        events = self._log.read(run_id)
+        if not events:
+            raise NothingToResume(f"没有可续跑的任务：{run_id!r}")
+        view = replay(events)
+        if view.status is not RunStatus.RUNNING:
+            return EngineResult(view=view, stop_reason=StopReason(view.status.value))
+        if view.steps and view.steps[-1].outcome is None:
+            return EngineResult(view=view, stop_reason=StopReason.UNCERTAIN)
+        return self._drive(run_id, view.max_steps)
+
+    def _drive(self, run_id: str, max_steps: int) -> EngineResult:
+        """主循环：按契约顺序追加事件、调用策略与工具、决定何时停止。
+
+        Args:
+            run_id: 任务标识。
+            max_steps: 最大决策步数。
+
+        Returns:
+            EngineResult: 停止时的视图与原因。
+
+        Raises:
+            InvalidEvent: 事件序列非法。
+
+        Notes:
             每轮顺序（不可调换）：
 
             1. 已决策步数 ``len(view.steps) >= max_steps`` → 追加 RUN_EXHAUSTED，
@@ -102,7 +166,6 @@ class Engine:
             工具结果的三种分类由 ``run_tool`` 判定，这里只按结果追加事件，不重新
             解释异常：一旦引擎自己猜测"这个异常大概没事"，UNCERTAIN 就失去意义。
         """
-        self._log.append(run_id, EventType.RUN_STARTED, {"task": task, "max_steps": max_steps})
         while True:
             view = self._view(run_id)
             if len(view.steps) >= max_steps:

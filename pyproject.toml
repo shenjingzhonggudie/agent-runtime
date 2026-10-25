@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []
 
+[project.scripts]
+agentrun = "agentrun.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.4",

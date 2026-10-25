@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 5 轮完成）
+> 最后更新：2026-10-25（第 6 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 5 轮完成：事件落盘到 SQLite，重启后可读回并重放出同一视图 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示、事件编解码、崩溃现场重放 |
-| 未实现能力 | 主动恢复（从日志接着跑）、对账工具化、追踪、CLI、真实模型 |
+| 当前里程碑 | 第 6 轮完成：可从日志续跑、可对账补记，并具备 CLI 入口 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、CLI 四个子命令 |
+| 未实现能力 | 事件追踪与时间线、真实模型策略 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -25,7 +25,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ├─ scripts/
 │  ├─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
 │  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
-│  └─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
+│  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
+│  └─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -35,8 +36,10 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
 │  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
 │  ├─ policy.py              ToolCall / Finish / Action / Policy 协议 / ScriptedPolicy
-│  ├─ engine.py              StopReason / EngineResult / Engine（循环、预算、终止）
-│  └─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
+│  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
+│  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
+│  ├─ reconcile.py           ReconcileResult / NothingToReconcile / pending_step / reconcile
+│  └─ cli.py                 argparse 入口：run / resume / status / reconcile
 └─ tests/
    ├─ test_package_smoke.py     包冒烟断言
    ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
@@ -47,10 +50,13 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_journal_sqlite.py    SQLite 日志：seq 连续、重开读回、原子回滚、并发不重号
    ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
    ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止
-   └─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
+   ├─ test_engine_resume.py     续跑：终态不重跑、未完成步骤先对账、预算取自日志
+   ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
+   ├─ test_reconcile.py         对账：查到才补记、查不到保持未知、补记后可续跑
+   └─ test_cli.py               CLI：脚本解析、子命令退出码、状态输出
 ```
 
-**故意不存在**：`trace.py` / `llm.py` / `cli.py`。
+**故意不存在**：`trace.py` / `llm.py`。
 
 ## 3. 已确认的公共接口
 
@@ -190,6 +196,52 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
    DEFERRED，两个连接会读到同一个 `last_seq`。
 
+### 3.8 引擎（`engine.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `Engine.run(run_id, task, max_steps)` | 新任务 | `EngineResult` | 写 `RUN_STARTED` 后进入主循环 |
+| `Engine.resume(run_id)` | 已存在的任务 | `EngineResult` | 不写 `RUN_STARTED`，预算取 `view.max_steps` |
+| `NothingToResume` | — | 异常 | 日志里没有该任务的任何事件 |
+
+**续跑的三种分支**（都不追加事件）：
+
+1. 视图已是终态 → 原样返回，`stop_reason` 由状态推出。
+2. 最后一步 `STEP_STARTED` 但没有结果 → 返回 `UNCERTAIN`。外部世界可能已经改变，
+   既不能重做也不能跳过，必须先对账。
+3. 其余 → 继续主循环。
+
+第 2 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
+
+### 3.9 对账（`reconcile.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `pending_step(view)` | 视图 | `int \| None` | 第一个「已开始、无结果」的步骤号 |
+| `reconcile(log, run_id, lookup)` | 日志、任务、只读查询工具 | `ReconcileResult` | 查到就补记，查不到不写 |
+| `NothingToReconcile` | — | 异常 | 没有待对账的步骤 |
+
+**三条走向**：
+
+1. `found=True` → 追加 `STEP_COMPLETED`，该步变为成功；携带的是**账本记录**，不是原
+   工具返回值（后者随进程一起丢了）。
+2. `found=False` → **不写任何事件**。查不到只说明此刻查不到，不能据此断言未生效。
+3. 查询失败 → 同样不写，原因写进 `detail`。
+
+### 3.10 CLI（`cli.py`）
+
+| 子命令 | 关键参数 | 退出码 |
+|---|---|---|
+| `run` | `--run-id --script [--task] [--max-steps]` | 0 成功 / 1 失败或耗尽 / 2 参数或脚本错 |
+| `resume` | `--run-id --script` | 同上；任务不存在时 2 |
+| `status` | `--run-id` | 0 / 任务不存在时 2 |
+| `reconcile` | `--run-id` | 0 已补记 / 2 无法确认或无需对账 |
+
+公共参数 `--db`（默认 `agentrun.db`）与 `--ledger`（默认 `ledger`）。
+
+策略不持久化：`ScriptedPolicy` 只依赖 `len(view.steps)`，所以 `resume` 需要重新给一份
+同样的脚本。策略属于调用方，不属于日志。
+
 ## 4. 依赖方向
 
 ```text
@@ -201,8 +253,10 @@ journal     → events / codec              （分配 seq、落盘；不判断�
 policy      → model
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
+reconcile   → journal / model / tools / events
+cli         → engine / journal / policy / tools / reconcile / ledger_tools / demo
 tests       → 全部
-scripts     → engine / policy / journal / ledger_tools / demo
+scripts     → engine / policy / journal / ledger_tools / reconcile / demo
 ```
 
 `model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`；
@@ -237,15 +291,18 @@ scripts     → engine / policy / journal / ledger_tools / demo
 | D22 | 表结构 | `runs(run_id, last_seq)` + `events(run_id, seq, body)` 两张表 | 2026-10-25 | 计数器是独立事实；`SELECT last_seq` + `UPDATE` 比 `MAX(seq)+1` 子查询更好排查，也不依赖 `RETURNING`（SQLite 3.35+） |
 | D23 | `body` 内容 | 存整条 `encode_event` 输出，同时保留 `seq` 列做主键与排序 | 2026-10-25 | `codec` 保持唯一格式来源；多一列换来 seq 一致性校验点 |
 | D24 | 连接策略 | 每次 `append` / `read` 新开连接，不持有长连接 | 2026-10-25 | 无状态，“重启”等于换实例；代价是每次多一次连接开销 |
+| D25 | 续跑预算 | 取日志里的 `view.max_steps`，不接收新参数 | 2026-10-25 | 预算属于任务；续跑时改预算等于事后改规则，日志里看不出来 |
+| D26 | 续跑已终结任务 | 返回现有视图 + 对应 `StopReason`，不抛异常、不追加事件 | 2026-10-25 | CLI 里“续跑一个早就成功的任务”是常见误操作，返回现状比栈信息有用 |
+| D27 | CLI 策略来源 | 读 JSON 脚本转成 `ScriptedPolicy`，用标准库 `argparse` | 2026-10-25 | 第 8 轮换模型策略时 CLI 不用动；不引 click，符合 D4 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 159 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 183 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（26 files） |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（10 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（31 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（12 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -254,17 +311,21 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 5 轮完成）
+- 时间：2026-10-25（第 6 轮完成）
 - 命令与结果：
-  - `pytest` → `159 passed`
+  - `pytest` → `183 passed`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `26 files already formatted`
-  - `mypy` → `Success: no issues found in 10 source files`
+  - `ruff format --check .` → `31 files already formatted`
+  - `mypy` → `Success: no issues found in 12 source files`
   - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
     第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
   - `python scripts/recovery_demo.py` → 退出码 0；重开数据库后 5 条事件与重放视图
     均与关闭前相等；崩溃现场 3 条事件重放为 `RUNNING`、`attempts=1`、`outcome=None`
-- 未验证：CI 远端运行、真实模型、主动恢复（从日志接着跑）、多进程并发
+  - `python scripts/reconcile_demo.py` → 退出码 0；崩溃现场 3 条事件 → 首次 resume
+    返回 `UNCERTAIN` 且余额不变 → 对账补记 step 1 → 再次 resume 跑完 8 条事件，
+    余额最终停在 `750/250`，转账只生效一次
+  - `python -m agentrun.cli run / status` → 退出码 0，事件 5 条，状态 `SUCCEEDED`
+- 未验证：CI 远端运行、真实模型、多进程并发
 
 ### 第 4 轮新增证据
 
@@ -289,10 +350,9 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 第 6 轮接入外部事件源时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
-| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 6 轮写入前的最后校验 |
-| `Engine.run` 每次都追加 `RUN_STARTED` | 已有日志上无法接着跑；现在的“恢复”只能重放，不能续跑 | 第 6 轮 CLI |
-| 崩溃现场的收尾是手工的 | 演示脚本直接 `append` 三条事件模拟崩溃，引擎自身没有“走到一半停下”的入口 | 第 6 轮对账 |
-| 对账逻辑只存在于演示脚本 | 引擎自己不会在 UNCERTAIN 后主动对账 | 第 6 轮对账 |
+| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
+| `reconcile` 只能补记成功 | 查到记录才有补记路径；判定「确实没生效」需要别的证据来源 | 需要人工判定失败时 |
+| 策略不持久化 | `resume` 必须重新提供脚本，脚本不同则续跑行为不同 | 第 8 轮模型策略 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
 | CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
@@ -304,4 +364,3 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 |---|---|---|
 | `trace.py` | 时间线、JSONL、只读监听 | 第 7 轮 |
 | `llm.py` | 模型适配器 | 第 8 轮 |
-| `cli.py` | 入口与依赖组装 | 第 6 轮 |
