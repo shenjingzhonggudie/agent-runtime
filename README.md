@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第 12 轮完成：有了真实模型客户端（标准库 HTTP），但从未联过真实服务。
+第 13 轮完成：多 worker 接管有了 epoch 栅栏，旧 worker 醒来后写不进日志。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -26,6 +26,9 @@
 - 提示里超长的参数与结果按 `field_limit`（默认 200 字）截断并标注截掉多少；截断是确定性的，同一视图仍渲染出同一份提示。
 - `HttpModelClient` 用标准库发 OpenAI 兼容请求：温度 0、不重试、超时即失败；错误信息不含密钥与提示。
 - 客户端只用本地 `http.server` 测过协议与坏响应；**没有真实服务凭据，真实兼容性未验证**。
+- 多 worker：`--owner` 启用租约，每次写事件带 `epoch` 栅栏；租约过期后可被接管，旧 worker 的写入被拒绝（`LOST`），任务状态不变。
+- 栅栏只保护日志：它不能阻止旧 worker 已经发出的工具调用，那部分仍靠对账与复核兜底。
+- `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 
@@ -58,6 +61,9 @@ python -m venv .venv
 ```powershell
 # 跑一个新任务
 .\.venv\Scripts\python.exe -m agentrun.cli run --run-id r1 --script task.json
+
+# 多 worker：带 owner 启用租约；另一个 owner 会得到「租约忙」
+.\.venv\Scripts\python.exe -m agentrun.cli run --run-id r1 --script task.json --owner w1
 
 # 查看事件与每一步状态
 .\.venv\Scripts\python.exe -m agentrun.cli status --run-id r1

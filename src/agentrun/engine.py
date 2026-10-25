@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from .events import EventType, make_step_key
-from .journal import EventLog
+from .events import Event, EventType, make_step_key
+from .journal import EventLog, Lease, LeaseBusy, LeaseLost
 from .model import Outcome, RunStatus, RunView, replay
 from .policy import Finish, Policy, PolicyError
 from .tools import Tool, ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
@@ -30,6 +30,9 @@ class StopReason(StrEnum):
 
     ``WAITING_REVIEW`` 与 ``ABORTED`` 来自日志里的复核记录：引擎自己不请求复核，
     只在 ``resume`` 时把状态原样带回，让调用方知道「这里需要人」还是「已经放弃了」。
+
+    ``LOST`` 表示本次工作期间租约被接管：写入被日志拒绝，任务状态仍是 ``RUNNING``
+    （或由接管者推进）。这不是任务的结局，是这个 worker 的结局。
     """
 
     SUCCEEDED = "SUCCEEDED"
@@ -38,6 +41,7 @@ class StopReason(StrEnum):
     UNCERTAIN = "UNCERTAIN"
     WAITING_REVIEW = "WAITING_REVIEW"
     ABORTED = "ABORTED"
+    LOST = "LOST"
 
 
 class NothingToResume(Exception):
@@ -68,12 +72,67 @@ class Engine:
         policy: 决策来源。
         registry: 工具注册表。
         log: 事件日志（v0 为内存实现）。
+        owner: 可选的 worker 标识。给出时，``run`` / ``resume`` 会先取租约，之后每次
+            写入都带 epoch 栅栏；没拿到租约抛 ``LeaseBusy``，工作途中被接管则返回
+            ``StopReason.LOST``。
+        lease_ttl: 租约时长（秒），默认 30。每写一条事件前续租一次。
+
+    Notes:
+        ``owner=None`` 时完全退化为 v1 的单 worker 行为：不取租约、不校验栅栏。
+        这是刻意的——单进程演示不该被并发语义拖慢。
     """
 
-    def __init__(self, policy: Policy, registry: ToolRegistry, log: EventLog) -> None:
+    def __init__(
+        self,
+        policy: Policy,
+        registry: ToolRegistry,
+        log: EventLog,
+        *,
+        owner: str | None = None,
+        lease_ttl: float = 30.0,
+    ) -> None:
         self._policy = policy
         self._registry = registry
         self._log = log
+        self._owner = owner
+        self._lease_ttl = lease_ttl
+        self._lease: Lease | None = None
+
+    def _append(self, run_id: str, type_: EventType, payload: Mapping[str, Any]) -> Event:
+        """按当前租约追加事件。
+
+        Args:
+            run_id: 任务标识。
+            type_: 事件类型。
+            payload: 事件字段。
+
+        Returns:
+            Event: 已写入的事件。
+
+        Raises:
+            LeaseLost: 租约已被接管或过期；本次写入没有发生。
+
+        Notes:
+            每次写入前先续租：工具调用可能耗时，靠「开始时取一次」撑不到最后。续租
+            与写入之间仍有窗口，所以真正的保护在日志的栅栏校验——续租只是把窗口缩小。
+        """
+        if self._lease is None:
+            return self._log.append(run_id, type_, payload)
+        self._lease = self._log.renew(self._lease, self._lease_ttl)
+        return self._log.append(run_id, type_, payload, lease=self._lease)
+
+    def _acquire(self, run_id: str) -> None:
+        """取得租约；未配置 owner 时什么也不做。
+
+        Raises:
+            LeaseBusy: 租约仍被其他 worker 占用。
+        """
+        if self._owner is None:
+            return
+        lease = self._log.acquire(run_id, self._owner, self._lease_ttl)
+        if lease is None:
+            raise LeaseBusy(f"{run_id!r} 的租约被其他 worker 占用")
+        self._lease = lease
 
     def _view(self, run_id: str) -> RunView:
         """从日志重放当前视图。
@@ -97,14 +156,22 @@ class Engine:
 
         Raises:
             InvalidEvent: 事件序列非法（属于编程错误，不应在正常运行中出现）。
+            LeaseBusy: 配置了 ``owner``，但租约被其他 worker 持有。
 
         Notes:
             只负责写 ``RUN_STARTED``，随后把控制权交给 ``_drive``。同一个 ``run_id``
             重复调用会再写一条 ``RUN_STARTED``，而 ``model.apply`` 会拒绝它——要接着
             上次的进度继续，请用 ``resume``。
         """
-        self._log.append(run_id, EventType.RUN_STARTED, {"task": task, "max_steps": max_steps})
-        return self._drive(run_id, max_steps)
+        self._acquire(run_id)
+        try:
+            self._append(run_id, EventType.RUN_STARTED, {"task": task, "max_steps": max_steps})
+            return self._drive(run_id, max_steps)
+        except LeaseLost:
+            events = self._log.read(run_id)
+            if not events:
+                raise
+            return EngineResult(view=replay(events), stop_reason=StopReason.LOST)
 
     def resume(self, run_id: str) -> EngineResult:
         """在已有日志上继续执行。
@@ -119,6 +186,7 @@ class Engine:
         Raises:
             NothingToResume: 日志里没有该任务的任何事件。
             InvalidEvent: 日志内容非法（编程错误或存储损坏，不应在正常运行中出现）。
+            LeaseBusy: 配置了 ``owner``，但租约被其他 worker 持有。
 
         Notes:
             五种情形，只有第 3 条会追加事件：
@@ -145,25 +213,29 @@ class Engine:
         view = replay(events)
         if view.status is not RunStatus.RUNNING:
             return EngineResult(view=view, stop_reason=StopReason(view.status.value))
-        if view.steps:
-            last = view.steps[-1]
-            if last.outcome is None and last.attempts == 0:
-                try:
-                    tool = self._registry.get(last.tool)
-                except UnknownTool:
-                    self._log.append(
-                        run_id,
-                        EventType.RUN_FAILED,
-                        {"reason": f"未注册的工具：{last.tool!r}"},
-                    )
-                    return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
-                stop = self._execute(run_id, last.step, tool, last.args, attempt=1)
-                if stop is not None:
-                    return stop
-                return self._drive(run_id, view.max_steps)
-            if last.outcome is None or last.outcome is Outcome.UNCERTAIN:
-                return EngineResult(view=view, stop_reason=StopReason.UNCERTAIN)
-        return self._drive(run_id, view.max_steps)
+        self._acquire(run_id)
+        try:
+            if view.steps:
+                last = view.steps[-1]
+                if last.outcome is None and last.attempts == 0:
+                    try:
+                        tool = self._registry.get(last.tool)
+                    except UnknownTool:
+                        self._append(
+                            run_id,
+                            EventType.RUN_FAILED,
+                            {"reason": f"未注册的工具：{last.tool!r}"},
+                        )
+                        return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
+                    stop = self._execute(run_id, last.step, tool, last.args, attempt=1)
+                    if stop is not None:
+                        return stop
+                    return self._drive(run_id, view.max_steps)
+                if last.outcome is None or last.outcome is Outcome.UNCERTAIN:
+                    return EngineResult(view=view, stop_reason=StopReason.UNCERTAIN)
+            return self._drive(run_id, view.max_steps)
+        except LeaseLost:
+            return EngineResult(view=self._view(run_id), stop_reason=StopReason.LOST)
 
     def _execute(
         self,
@@ -194,7 +266,7 @@ class Engine:
             可观察时刻。如果先执行后写意图，崩溃窗口就会变成「做了但日志不知道」，而
             本项目的整个恢复语义都建立在这条顺序上。
         """
-        self._log.append(run_id, EventType.STEP_STARTED, {"step": step, "attempt": attempt})
+        self._append(run_id, EventType.STEP_STARTED, {"step": step, "attempt": attempt})
         ctx = ToolContext(
             run_id=run_id,
             step=step,
@@ -204,20 +276,20 @@ class Engine:
         outcome = run_tool(tool, args, ctx)
 
         if outcome.status == ToolStatus.SUCCEEDED:
-            self._log.append(
+            self._append(
                 run_id,
                 EventType.STEP_COMPLETED,
                 {"step": step, "result": dict(outcome.value or {})},
             )
             return None
         if outcome.status == ToolStatus.FAILED:
-            self._log.append(
+            self._append(
                 run_id,
                 EventType.STEP_FAILED,
                 {"step": step, "error": dict(outcome.error or {})},
             )
             return None
-        self._log.append(
+        self._append(
             run_id, EventType.STEP_UNCERTAIN, {"step": step, "reason": outcome.reason or ""}
         )
         return EngineResult(view=self._view(run_id), stop_reason=StopReason.UNCERTAIN)
@@ -261,27 +333,27 @@ class Engine:
         while True:
             view = self._view(run_id)
             if len(view.steps) >= max_steps:
-                self._log.append(run_id, EventType.RUN_EXHAUSTED, {"max_steps": max_steps})
+                self._append(run_id, EventType.RUN_EXHAUSTED, {"max_steps": max_steps})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.EXHAUSTED)
             try:
                 action = self._policy.decide(view)
             except PolicyError as exc:
-                self._log.append(run_id, EventType.RUN_FAILED, {"reason": str(exc)})
+                self._append(run_id, EventType.RUN_FAILED, {"reason": str(exc)})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
 
             if isinstance(action, Finish):
-                self._log.append(run_id, EventType.RUN_SUCCEEDED, {"answer": action.answer})
+                self._append(run_id, EventType.RUN_SUCCEEDED, {"answer": action.answer})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.SUCCEEDED)
             try:
                 tool = self._registry.get(action.tool)
             except UnknownTool:
-                self._log.append(
+                self._append(
                     run_id, EventType.RUN_FAILED, {"reason": f"未注册的工具：{action.tool!r}"}
                 )
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
 
             step = len(view.steps) + 1
-            self._log.append(
+            self._append(
                 run_id,
                 EventType.STEP_DECIDED,
                 {

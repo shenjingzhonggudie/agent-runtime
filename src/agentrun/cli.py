@@ -26,7 +26,7 @@ from typing import Any
 
 from .demo import Ledger
 from .engine import Engine, NothingToResume, StopReason
-from .journal import SqliteEventLog
+from .journal import LeaseBusy, SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
 from .model import REVIEW_DECISIONS, InvalidEvent, RunView, replay
 from .policy import Action, Finish, ScriptedPolicy, ToolCall
@@ -145,8 +145,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     """执行 ``run`` 子命令。"""
     actions = load_actions(args.script)
     log = SqliteEventLog(args.db)
-    engine = Engine(ScriptedPolicy(actions), build_registry(args.ledger), log)
-    result = engine.run(args.run_id, args.task or args.run_id, args.max_steps)
+    engine = Engine(
+        ScriptedPolicy(actions),
+        build_registry(args.ledger),
+        log,
+        owner=args.owner,
+        lease_ttl=args.lease_ttl,
+    )
+    try:
+        result = engine.run(args.run_id, args.task or args.run_id, args.max_steps)
+    except LeaseBusy as exc:
+        print(f"没有拿到租约：{exc}")
+        return 2
     print_view(result.view)
     print(f"停止原因：{result.stop_reason}")
     return exit_code_for(result.stop_reason)
@@ -156,11 +166,20 @@ def cmd_resume(args: argparse.Namespace) -> int:
     """执行 ``resume`` 子命令。"""
     actions = load_actions(args.script)
     log = SqliteEventLog(args.db)
-    engine = Engine(ScriptedPolicy(actions), build_registry(args.ledger), log)
+    engine = Engine(
+        ScriptedPolicy(actions),
+        build_registry(args.ledger),
+        log,
+        owner=args.owner,
+        lease_ttl=args.lease_ttl,
+    )
     try:
         result = engine.resume(args.run_id)
     except NothingToResume as exc:
         print(f"无法续跑：{exc}")
+        return 2
+    except LeaseBusy as exc:
+        print(f"没有拿到租约：{exc}")
         return 2
     print_view(result.view)
     print(f"停止原因：{result.stop_reason}")
@@ -257,11 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     run_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     run_p.add_argument("--max-steps", type=int, default=10)
+    run_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
+    run_p.add_argument("--lease-ttl", type=float, default=30.0)
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser("resume", help="接着上次的进度继续")
     resume_p.add_argument("--run-id", required=True)
     resume_p.add_argument("--script", required=True, type=Path)
+    resume_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
+    resume_p.add_argument("--lease-ttl", type=float, default=30.0)
     resume_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     resume_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     resume_p.set_defaults(func=cmd_resume)

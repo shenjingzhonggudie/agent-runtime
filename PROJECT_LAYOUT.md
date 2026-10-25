@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 12 轮完成）
+> 最后更新：2026-10-25（第 13 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 12 轮完成：真实模型客户端落地（离线协议测试），v1 功能闭环 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
-| 未实现能力 | 真实模型服务联调（无凭据）；多 worker 接管 |
+| 当前里程碑 | 第 13 轮完成：租约、epoch 与写入栅栏，跨进程接管由真实进程验证 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -30,6 +30,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
 │  ├─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
 │  ├─ crash_runner.py        进程级故障注入：os._exit 在三个窗口退出（测试夹具）
+│  ├─ lease_worker.py        租约 worker：hold / takeover 两个模式（测试夹具）
 │  └─ eval_suite.py          离线评测集：8 种结局一张表
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
@@ -38,7 +39,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ model.py               RunStatus / Outcome / ReviewView / InvalidEvent / StepView / RunView / apply / replay
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
-│  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
+│  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / 两个实现（原子追加、租约栅栏）
 │  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
 │  ├─ model_client.py        ModelClientError / HttpModelClient / _extract_content / client_from_env
@@ -64,6 +65,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_reconcile.py         对账：查到才补记、查不到提交复核、补记后可续跑
    ├─ test_review.py            复核：暂停态、三种结论、重复复核、续跑闸门
    ├─ test_process_crash.py     进程级：三个窗口真退进程后由新进程恢复
+   ├─ test_lease.py             租约：epoch、续租、过期、栅栏拒写、引擎失联
+   ├─ test_process_takeover.py  接管：两个真实进程，旧 worker 醒来写入被拒
    ├─ test_trace.py             时间线：十一种事件可渲染、JSONL 可回读、不修改原事件
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
@@ -195,14 +198,18 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `EventLog` 协议 | — | — | `append(run_id, type_, payload)` 与 `read(run_id)` |
-| `MemoryEventLog` | — | 实例 | 内存实现，仅用于 v0 与测试 |
-| `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化；构造时不连接、不建表 |
+| `EventLog` 协议 | — | — | `append(run_id, type_, payload, *, lease=None)`、`read`、`acquire`、`renew`、`release` |
+| `Lease` | — | 冻结 dataclass | `run_id / owner / epoch / expires_at`；epoch 是接管代数 |
+| `LeaseLost` | — | 异常 | 写入被拒：被接管、非持有者，或从未持有。**这次写入没有发生** |
+| `LeaseBusy` | — | 异常 | 开始工作前就发现租约在别人手里 |
+| `MemoryEventLog` | — | 实例 | 内存实现，仅用于测试与单进程 |
+| `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化与租约；构造时不连接、不建表 |
 
 **表结构**：
 
 ```sql
-runs   (run_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)
+runs   (run_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL,
+        owner TEXT, epoch INTEGER NOT NULL DEFAULT 0, lease_expires_at REAL)
 events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY (run_id, seq))
 ```
@@ -219,6 +226,12 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
    内编码的 `seq` 不一致时抛 `DecodeError`，不以列为准继续。
 4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
    DEFERRED，两个连接会读到同一个 `last_seq`。
+5. **写栅栏**：`runs.owner` 非空时，`append` 必须携带 owner 与 epoch 都匹配的
+   `Lease`，否则 `LeaseLost` 并整条回滚。校验与 `seq` 分配在同一个
+   `BEGIN IMMEDIATE` 里——分两步就会让旧 worker 与新 worker 各写一条。
+6. `epoch` 只在**接管**时加一；同一 owner 重复 `acquire` 不涨。续租只改到期时间。
+7. 旧库通过 `PRAGMA table_info` 判断缺列后 `ALTER TABLE`，不重建表：重建会丢事件，
+   也可能制造孤儿任务。
 
 ### 3.8 引擎（`engine.py`）
 
@@ -246,6 +259,11 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 **决策失败**：`policy.decide` 抛 `PolicyError`（`ScriptExhausted` 也是它）→ 追加
 `RUN_FAILED`，停止，原因 `FAILED`。此时一条 `STEP_DECIDED` 都没有，因此可以断言零副作用；
 不能记成 `UNCERTAIN`——那个状态只留给「可能已经改了」。
+
+**租约**：构造时给 `owner` 才启用。`run` / `resume` 先 `acquire`，拿不到抛
+`LeaseBusy`；每次写事件前 `renew`，再带 `lease` 追加。写被日志拒绝 → 返回
+`StopReason.LOST`，任务状态不变（`LOST` 是这个 worker 的结局，不是任务的）。
+`owner=None` 完全退化为单 worker：不取租约、不校验栅栏。
 
 ### 3.9 对账与人工复核（`reconcile.py`）
 
@@ -289,8 +307,8 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 | 子命令 | 关键参数 | 退出码 |
 |---|---|---|
-| `run` | `--run-id --script [--task] [--max-steps]` | 0 成功 / 1 失败或耗尽 / 2 参数或脚本错 |
-| `resume` | `--run-id --script` | 同上；任务不存在时 2 |
+| `run` | `--run-id --script [--task] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或失联 / 2 参数、脚本或租约忙 |
+| `resume` | `--run-id --script [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
 | `status` | `--run-id` | 0 / 任务不存在时 2 |
 | `reconcile` | `--run-id` | 0 已补记或已提交复核 / 2 查询失败或无需对账 |
 | `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON]` | 0 已写入 / 2 没有待复核或参数错 |
@@ -450,14 +468,18 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D42 | 提示截断策略 | 按字段截断（默认 200 字）并标注截掉多少，而不是整段提示一刀切 | 2026-10-25 | 整段截断会切掉工具清单与输出约定，模型反而更容易乱答；按字段截断保留结构，且确定性可测 |
 | D43 | HTTP 客户端边界 | 标准库、无重试、无流式、不解析动作、错误不含密钥与提示 | 2026-10-25 | 重试与解析属于外层；客户端只负责「这一次调用拿到了什么」。代价是超时/限流要由调用方兜底 |
 | D44 | 真实服务验证方式 | 只用本地 `http.server` 测协议，文档明写「未联真实服务」 | 2026-10-25 | 没有凭据就不假装验证过；把边界写清楚，比一个猜出来的兼容性结论有用 |
+| D45 | 租约放在哪一层 | 日志层（SQLite 行内字段），不放引擎内存或独立锁服务 | 2026-10-25 | 栅栏校验必须与 `seq` 分配在同一个事务里；放在别处就一定有「校验通过但写入已过期」的窗口 |
+| D46 | epoch 何时加一 | 只在接管时加一；同 owner 重取、续租都不变 | 2026-10-25 | 每次重启都加一会让 worker 把自己的旧写入判成非法；只在接管时加，才能精确表达「换人了」 |
+| D47 | 失联的表示 | `StopReason.LOST`，不改任务状态 | 2026-10-25 | 失联是 worker 的结局，不是任务的结局；任务仍 `RUNNING`，等接管者推进 |
+| D48 | 租约默认值 | `owner=None` 关闭租约；启用时 `lease_ttl=30`，每次写前续租 | 2026-10-25 | 单进程演示不该被并发语义拖慢；默认 30 秒覆盖一次工具调用，短了会误判失联 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 280 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 288 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（44 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（47 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -467,16 +489,17 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 12 轮完成）
+- 时间：2026-10-25（第 13 轮完成）
 - 命令与结果：
-  - `pytest` → `280 passed`（新增 9 例：请求形状、四种坏响应、超时、策略拼接、
-    环境变量两组）
+  - `pytest` → `288 passed`（新增 8 例：租约/epoch/栅栏 7 例、跨进程接管 1 例）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `44 files already formatted`
+  - `ruff format --check .` → `47 files already formatted`
   - `mypy` → `Success: no issues found in 15 source files`
+  - `tests/test_process_takeover.py` → 进程 A 持租约、写三步后卡在工具里；租约过期，
+    进程 B 以 `EPOCH 2` 接管；A 醒来写结果被拒，退出码 7、输出 `LOST`；日志仍是
+    3 条事件；B 重新取租约（epoch 仍为 2）后可写
   - `python scripts/eval_suite.py` → `8/8 通过`
-  - 客户端测试全部走本地 `http.server`（127.0.0.1 随机端口），不访问外网
-- 未验证：真实模型服务（无凭据）、CI 远端运行、多进程并发、`kill -9` 与断电
+- 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电
 
 ### 第 4 轮新增证据
 
@@ -501,6 +524,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
+| 栅栏只保护日志，不保护副作用 | 旧 worker 的工具调用可能已经发出；日志拒写不等于外部世界没变 | 永久边界，靠对账与复核兜底 |
+| 租约 TTL 依赖本机时钟 | 没有时钟漂移校正；跨机器部署时 `expires_at` 不可比 | 跨机器多 worker 时 |
 | 进程级故障只模拟 `os._exit` | 不等于 `kill -9`、断电或 fsync 丢失；存储层语义未验证 | 需要真机断电 / 容器 kill 时 |
 | 评测集绑在模拟账本上 | 8 个场景都基于 `demo.Ledger`，没有真实外部系统与网络抖动 | 接入真实外部服务时 |
 | 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
