@@ -14,7 +14,7 @@ from .events import EventType, make_step_key
 from .journal import EventLog
 from .model import RunView, replay
 from .policy import Finish, Policy
-from .tools import ToolRegistry, ToolStatus, UnknownTool, run_tool
+from .tools import ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
 
 
 class StopReason(StrEnum):
@@ -99,13 +99,8 @@ class Engine:
             7. 结果是 UNCERTAIN → 立即停止，原因 UNCERTAIN，视图保持 RUNNING，
                不再追加任何事件。其他结果回到第 1 步。
 
-            实现时需要的导入：``EventType``、``apply`` 不需要；需要
-            ``from .events import EventType``、``from .model import apply, replay``
-            中的 replay 已在模块顶部导入；还需要
-            ``from .policy import Finish, ToolCall``、``from .tools import
-            ToolStatus, UnknownTool, run_tool``、``from .events import
-            make_step_key``。按需增减，但不要让工具分类逻辑泄漏到这里——它已经在
-            ``run_tool`` 里做完了。
+            工具结果的三种分类由 ``run_tool`` 判定，这里只按结果追加事件，不重新
+            解释异常：一旦引擎自己猜测"这个异常大概没事"，UNCERTAIN 就失去意义。
         """
         self._log.append(run_id, EventType.RUN_STARTED, {"task": task, "max_steps": max_steps})
         while True:
@@ -138,7 +133,14 @@ class Engine:
             )
             self._log.append(run_id, EventType.STEP_STARTED, {"step": step, "attempt": 1})
 
-            outcome = run_tool(tool, action.args)
+            ctx = ToolContext(
+                run_id=run_id,
+                step=step,
+                attempt=1,
+                step_key=make_step_key(run_id, step),
+            )
+            outcome = run_tool(tool, action.args, ctx)
+
             if outcome.status == ToolStatus.SUCCEEDED:
                 self._log.append(
                     run_id,

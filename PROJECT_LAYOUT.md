@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-20（第 1 轮结束）
+> 最后更新：2026-10-24（第 3 轮 3B 完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 3 轮进行中：3A（引擎循环）完成；3B（账本工具 + 演示）待做 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算 |
-| 未实现能力 | 持久化日志、恢复、对账、追踪、CLI、真实模型、账本工具适配器 |
+| 当前里程碑 | 第 3 轮 3B 完成：账本工具与演示脚本可运行，待学习者复盘 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示 |
+| 未实现能力 | 持久化日志、恢复、对账工具化、追踪、CLI、真实模型 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -23,27 +23,30 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ├─ .gitignore
 ├─ .github/workflows/ci.yml  CI：安装 → lint → format → mypy → pytest
 ├─ scripts/
-│  └─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
+│  ├─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
+│  └─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
 │  ├─ events.py              事件契约：EventType / Event / make_step_key
 │  ├─ model.py               RunStatus / Outcome / InvalidEvent / StepView / RunView / apply / replay
-│  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolRegistry / run_tool
+│  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
 │  ├─ journal.py             EventLog 协议 + MemoryEventLog（分配 seq）
-│  ├─ policy.py              ToolCall / Finish / Policy 协议 / ScriptedPolicy
-│  └─ engine.py              StopReason / EngineResult / Engine（循环、预算、终止）
+│  ├─ policy.py              ToolCall / Finish / Action / Policy 协议 / ScriptedPolicy
+│  ├─ engine.py              StopReason / EngineResult / Engine（循环、预算、终止）
+│  └─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 └─ tests/
-   ├─ test_package_smoke.py  2 个冒烟断言
-   ├─ test_demo_ledger.py    15 个账本测试
-   ├─ test_model_contract.py 26 个事件折叠契约测试
-   ├─ test_tools_contract.py 14 个工具执行测试（含计数 Fake 工具）
-   ├─ test_journal_contract.py 4 个内存日志测试
-   ├─ test_policy_contract.py  4 个策略测试
-   └─ test_engine_contract.py 10 个引擎契约测试
+   ├─ test_package_smoke.py     包冒烟断言
+   ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
+   ├─ test_model_contract.py    事件折叠契约：顺序、seq、终态、结果唯一性
+   ├─ test_tools_contract.py    工具执行：校验零副作用、异常分类、注册表
+   ├─ test_journal_contract.py  内存日志：seq 按 run 独立分配
+   ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
+   ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止
+   └─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
 ```
 
-**故意不存在**：`tools.py` / `policy.py` / `engine.py` / `journal.py` / `trace.py` / `llm.py` / `cli.py`。
+**故意不存在**：`trace.py` / `llm.py` / `cli.py`。
 
 ## 3. 已确认的公共接口
 
@@ -100,12 +103,13 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
 | `SideEffect` | — | 3 值枚举 | `READ_ONLY / IDEMPOTENT / NON_IDEMPOTENT` |
-| `Tool` 协议 | — | — | `name`、`side_effect`、`validate(args)`、`run(args)` |
+| `Tool` 协议 | — | — | `name`、`side_effect`、`validate(args, ctx)`、`run(args, ctx)` |
+| `ToolContext` | `run_id, step, attempt, step_key` | 冻结 dataclass | 由引擎构造；幂等键只能取自 `step_key`，不能取自 `args` |
 | `InvalidArgs` | — | 异常 | 参数不合法，**工具未被调用** |
 | `ToolRejected` | — | 异常 | 已调用，业务拒绝，**确定未生效** |
 | `ToolCrashed` | — | 异常 | 已调用，崩溃，**效果未知** |
 | `ToolRegistry` | — | — | `register / get / names`；重名抛 `DuplicateTool`，未知抛 `UnknownTool` |
-| `run_tool(tool, args)` | 工具、参数 | `ToolOutcome` | 只执行一次，不重试；把结果归为 `SUCCEEDED / FAILED / UNCERTAIN` |
+| `run_tool(tool, args, ctx)` | 工具、参数、上下文 | `ToolOutcome` | 只执行一次，不重试；把结果归为 `SUCCEEDED / FAILED / UNCERTAIN` |
 
 **分类规则（不可调换顺序）**：
 
@@ -117,17 +121,38 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 | `run` 抛 `ToolRejected` | FAILED，`kind=rejected` | 确定未生效 |
 | `run` 抛 `ToolCrashed` 或其他 `Exception` | UNCERTAIN | **绝不能归为 FAILED** |
 
+### 3.5 账本工具（`ledger_tools.py`）
+
+| 接口 | 参数 | 副作用类别 | 说明 |
+|---|---|---|---|
+| `GetBalance` | `owner` | `READ_ONLY` | 未知账户返回 0；账本不可读抛 `ToolRejected` |
+| `Transfer` | `src`、`dst`、`amount` | `NON_IDEMPOTENT` | 幂等键取 `ctx.step_key`；业务拒绝与非幂等都映射为 `ToolRejected` |
+| `SaveReceipt` | `text` | `IDEMPOTENT` | 幂等键取 `ctx.step_key`；同一键只保留首次内容 |
+| `LookupRequest` | `request_id` | `READ_ONLY` | 查到时返回 `{found, kind, amount}`，查不到返回 `{found: False}` |
+
+**统一约束**：
+
+1. `validate` 只读 `args`，不碰账本，因此任何校验失败都对应零副作用。
+2. 幂等键一律取自 `ctx.step_key`（`run_id:step`），**不取自 `args`**：`args` 由策略
+   给出，若允许从其中取键，调用方就能绕过步骤级去重。
+3. `amount` 拒绝 `bool`：`True` 是 `int` 的子类，不单独判断就会被当成 1。
+
 ## 4. 依赖方向
 
 ```text
-model → events          （无 I/O、无数据库、无模型服务）
-tools → 无内部依赖       （不认识 model / events / journal，不写事件）
-tests → model / events / demo / tools
-scripts → demo
-engine（未来）→ tools
+events      → 无
+model       → events                      （无 I/O、无数据库、无模型服务）
+tools       → 无内部依赖                   （不认识 model / events / journal，不写事件）
+journal     → events
+policy      → model
+engine      → policy / tools / journal / model / events
+ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
+tests       → 全部
+scripts     → engine / policy / journal / ledger_tools / demo
 ```
 
-`model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`。
+`model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`；
+`ledger_tools` 不得写事件、不得分配 `seq`、不得重试、不得判断预算。
 
 ## 5. 学习者已确认的决策
 
@@ -148,15 +173,18 @@ engine（未来）→ tools
 | D13 | 参数校验位置 | 工具自己实现 `validate(args)` | 2026-10-20 | 不造 schema 语言；重复校验的风险由契约约束 |
 | D14 | 异常映射 | 三异常 + 未知异常 → UNCERTAIN | 2026-10-20 | 避免把已生效调用当失败而重做 |
 | D15 | 结果类型 | tools 自己的 `ToolStatus/ToolOutcome`，engine 负责映射 | 2026-10-20 | tools 不依赖 model，代价是 3 行映射 |
+| D16 | 工具签名 | `validate(args, ctx)` / `run(args, ctx)`，由 engine 构造 `ToolContext` | 2026-10-24 | 工具拿得到 `step_key`；代价是所有工具与 Fake 工具都要改签名 |
+| D17 | 账本异常映射 | `LedgerRejected` / `LedgerCorrupted` 一律映射为 `ToolRejected` | 2026-10-24 | 账本的读盘先于写盘，失败时可证明零副作用；不映射成 `ToolCrashed` 是为了不把“确定没生效”说成“不知道” |
+| D18 | 续跑演示的位置 | 对账策略写在 `scripts/ledger_demo.py`，不进 `policy.py` | 2026-10-24 | 它只服务这一个验收场景；进库会把演示逻辑变成公共 API |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 43 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 105 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过 |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（5 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（22 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（9 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -165,12 +193,14 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-20（第 2 轮结束）
+- 时间：2026-10-24（第 3 轮 3B 完成）
 - 命令与结果：
-  - `pytest` → `75 passed in 0.81s`
+  - `pytest` → `105 passed`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `19 files already formatted`
-  - `mypy` → `Success: no issues found in 8 source files`
+  - `ruff format --check .` → `22 files already formatted`
+  - `mypy` → `Success: no issues found in 9 source files`
+  - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
+    第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
 - 未验证：CI 远端运行、真实模型、持久化、恢复、并发
 
 ### 历史环境事件
@@ -185,9 +215,10 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `StepView.args` 与事件 payload 共享同一 dict | 观察者修改会污染视图与日志 | 第 7 轮监听器隔离 |
 | `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 第 6 轮 CLI |
 | `replay` 信任调用方给定顺序 | 乱序输入不会被发现 | 第 5 轮 Journal |
-| `request_id` 在 transfer / receipt 间未隔离 | 同 id 跨类型时 `lookup` 返回先写入者 | 第 3 轮写账本工具适配器 |
+| `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
 | `run` 返回非 Mapping 时未校验 | 成功结果可能不是可序列化对象 | 第 4 轮结果落盘前 |
+| 对账逻辑只存在于演示脚本 | 引擎自己不会在 UNCERTAIN 后主动对账 | 第 6 轮对账 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
 | CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
@@ -197,10 +228,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
-| `policy.py` | Policy 协议、ScriptedPolicy | 第 3 轮 |
-| `engine.py` | 驱动循环、预算、执行与停止 | 第 3 轮起 |
-| `ledger_tools.py` | 账本工具适配器（查余额 / 转账 / 回执 / 对账） | 第 3 轮 |
-| `journal.py` | SQLite 事件日志、原子追加、seq 分配 | 第 5 轮 |
+| `journal.py` 的 SQLite 实现 | 原子追加、`seq` 分配、跨进程持久化 | 第 5 轮 |
 | `trace.py` | 时间线、JSONL、只读监听 | 第 7 轮 |
 | `llm.py` | 模型适配器 | 第 8 轮 |
 | `cli.py` | 入口与依赖组装 | 第 6 轮 |

@@ -98,6 +98,28 @@ class ToolOutcome:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ToolContext:
+    """一次工具调用的身份信息，由引擎构造后传给工具。
+
+    Attributes:
+        run_id: 所属任务标识。
+        step: 第几次决策，从 1 开始。
+        attempt: 第几次尝试，从 1 开始；v0 恒为 1。
+        step_key: 由 ``run_id`` 与 ``step`` 推出的跨重试稳定键。工具需要幂等键时
+            必须用它，而不是从 ``args`` 里取——``args`` 由策略给出，不受引擎约束。
+
+    Notes:
+        工具不得修改本对象的字段（``frozen`` 已保证），也不得把它当作可变状态
+        容器使用。
+    """
+
+    run_id: str
+    step: int
+    attempt: int
+    step_key: str
+
+
 @runtime_checkable
 class Tool(Protocol):
     """工具必须满足的协议。
@@ -114,11 +136,11 @@ class Tool(Protocol):
     name: str
     side_effect: SideEffect
 
-    def validate(self, args: Mapping[str, Any]) -> None:
+    def validate(self, args: Mapping[str, Any], ctx: ToolContext) -> None:
         """校验参数；不合法时抛 ``InvalidArgs``，且不得产生副作用。"""
         ...
 
-    def run(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
+    def run(self, args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, Any]:
         """执行一次工具调用，返回可序列化的结果。
 
         Raises:
@@ -163,7 +185,7 @@ class ToolRegistry:
         return tuple(sorted(self._tools))
 
 
-def run_tool(tool: Tool, args: Mapping[str, Any]) -> ToolOutcome:
+def run_tool(tool: Tool, args: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
     """校验并执行一次工具调用，把结果归类成三种之一。
 
     Args:
@@ -201,14 +223,14 @@ def run_tool(tool: Tool, args: Mapping[str, Any]) -> ToolOutcome:
         )
 
     try:
-        tool.validate(args)
+        tool.validate(args, ctx)
     except Exception as e:
         return ToolOutcome(
             status=ToolStatus.FAILED, error={"kind": "invalid_args", "message": str(e)}
         )
 
     try:
-        result = tool.run(args)
+        result = tool.run(args, ctx)
         return ToolOutcome(status=ToolStatus.SUCCEEDED, value=result)
     except ToolRejected as e:
         return ToolOutcome(status=ToolStatus.FAILED, error={"kind": "rejected", "message": str(e)})

@@ -13,7 +13,7 @@ from agentrun.events import EventType
 from agentrun.journal import MemoryEventLog
 from agentrun.model import Outcome, RunStatus, replay
 from agentrun.policy import Action, Finish, ToolCall
-from agentrun.tools import SideEffect, ToolRegistry, ToolRejected
+from agentrun.tools import SideEffect, ToolContext, ToolRegistry, ToolRejected
 
 
 @dataclass
@@ -24,10 +24,10 @@ class FakeTool:
     error: Exception | None = None
     calls: int = 0
 
-    def validate(self, args: Mapping[str, Any]) -> None:
+    def validate(self, args: Mapping[str, Any], ctx: ToolContext) -> None:
         return None
 
-    def run(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
+    def run(self, args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, Any]:
         self.calls += 1
         if self.error is not None:
             raise self.error

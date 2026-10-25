@@ -179,3 +179,89 @@
   4. 前一轮遗留：`args` 共享引用、`RUN_FAILED` 原因未进视图、`replay` 信任顺序、账本无版本号、读改写无锁、CI 未远端运行、Docker 未触发。
 
 - **本轮状态**：完成（实现、验证、复盘均完成；Q1 判断错误已纠正）。
+
+## 协作方式变更（2026-10-24，第 3 轮 3B 起点）
+
+- 学习者要求：**Agent 只写测试与注释（docstring），其余代码全部由学习者写**，包括工具协议修改、
+  `ledger_tools.py`、演示脚本、配置变更。
+- 影响：
+  1. 不再由 Agent 提供可直接运行的骨架；改为在消息中给出精确签名规格，由学习者落笔。
+  2. 测试仍然先写：学习者先建“只有签名 + NotImplementedError”的模块，Agent 补测试，形成有效红。
+  3. 架构文档与学习日志仍由 Agent 维护；代码内的 docstring 由 Agent 补，且不得改写实现。
+- 理由（学习者）：希望在实现层获得完整的手感，而不是在既有骨架上填空。
+
+## 第 3 轮：引擎循环与账本工具
+
+- **本轮目标与架构位置**：把策略、工具、日志串成可运行的循环（3A），再把模拟账本包装成四个满足
+  `Tool` 协议的应用工具，并用一个演示脚本验证“重启后靠对账避免重复扣款”（3B）。
+  位置：`engine` 位于最外层，向下调用 `policy` 取动作、`tools` 执行、`journal` 记事实、`model` 折叠视图；
+  `ledger_tools` 是 `demo` 与 `tools` 之间唯一的适配层。
+
+- **已确认的契约 / 决策，以及学习者的理由**：
+  - 3A：`Engine.run` 的七步顺序（预算判断先于问策略、`STEP_DECIDED` 先于 `STEP_STARTED`、
+    UNCERTAIN 立即停止且不追加事件）。
+  - 3B：D16 工具签名注入 `ToolContext`、D17 账本异常一律映射为 `ToolRejected`、
+    D18 对账策略留在演示脚本而不进 `policy.py`。学习者对 D16 的采纳理由是“工具拿不到 `step_key`
+    就只能从 `args` 里编一个键，那就等于没有幂等”。
+
+- **学习者的手工推演**：3B 阶段未做纸上推演。改为先写工具骨架，再由 Agent 补测试形成有效红，
+  之后逐个工具改到绿。
+
+- **遇到的问题与最小复现**：
+  1. `LookupRequest.run` 调用了 `Ledger` 上不存在的 `lookup_request`。复现：`mypy` →
+     `"Ledger" has no attribute "lookup_request"`。根因是账本方法名是 `lookup`，写的时候按工具名
+     反推了方法名。
+  2. `FakeTool` 的方法仍是 `validate(self, args)` / `run(self, args)`，没有跟上 D16 的 `ctx`。
+     后果：`2 failed, 103 passed`。补上 `ctx: ToolContext` 后 105 全绿。
+  3. `ruff check` 报 `engine.py` 导入未排序、`ruff format` 报 `ledger_tools.py` 多一空行，
+     拖到最后才修。这两处都不影响行为，但让“全绿”这个信号迟到了两轮。
+  4. **演示脚本第一版是不可运行的骨架**：`root.name + "/ledger"` 传了 `str` 给要求 `Path` 的
+     `Ledger`（`AttributeError: 'str' object has no attribute 'mkdir'`）、`GetBalance` 与 `Transfer`
+     各注册两次（`DuplicateTool`）、每个工具各建一个 `Ledger` 实例、`save_receipt` 没有对应工具
+     （会走成 `UnknownTool`）、没有任何 `print`、模块顶层直接执行、文件放在 `src/agentrun/` 会被
+     打进发行包、相对与绝对导入混用。
+
+- **最初假设 / Agent 是否误判**：
+  - 误判：给出“精确到调用链的规格”后，假设学习者会先跑一次再交付。实际交付物连第一行都过不去。
+    责任不全在学习者——规格里没有写“交付前必须先执行一次”，而这一条恰恰是唯一能拦住上述
+    8 个问题的动作。已在后续轮次改为“交付物必须附一次真实执行的输出”。
+  - 未误判：`ToolContext` 注入后 `run_tool` 的分类逻辑无需改动，说明第 2 轮把“分类依据是
+    有没有执行过”收口在 `run_tool` 内部是对的。
+
+- **验证命令、结果与证据**：
+  - `pytest` → `105 passed`
+  - `mypy` → `Success: no issues found in 9 source files`
+  - `ruff check .` → `All checks passed!`；`ruff format --check .` → `22 files already formatted`
+  - `python scripts/ledger_demo.py` → 退出码 0。第一次运行 11 条事件，
+    `alice 1000→750`、`bob 0→250`；第二次运行换新日志、复用同一账本目录，
+    仅 5 条事件（`lookup_request` → `found=True` → `RUN_SUCCEEDED`），余额保持 `750/250`。
+
+- **根因与可迁移规律**：
+  1. 幂等键必须来自引擎（`step_key`），不能来自策略。策略给的 `args` 是业务参数，
+     一旦允许它携带调用标识，调用方就能绕过步骤级去重。
+  2. “确定未生效”与“读不出可信状态”在适配层必须收敛成同一个对外语义，否则引擎会为了区分它们
+     而被迫认识账本内部结构。本轮的取舍是都映射为 `ToolRejected`，依据是账本读盘先于写盘。
+  3. 演示脚本的价值在于**能跑**。它不产生契约，但它是唯一能证明“这四个工具真的能装进引擎”的证据；
+     一个跑不起来的演示，其信息量低于没有演示。
+
+- **架构问题（学习者先答，Agent 不附答案）**：
+  1. 第二次运行中，`ReconcilePolicy` 用 `make_step_key(run_id, 2)` 去查上一次的转账。如果它改用
+     第一次运行 `STEP_COMPLETED` 里返回的 `result["request_id"]`，在什么情况下会查不出结果？
+  2. `Found=False` 时策略直接重做转账。账本 `lookup` 的文档说 `None` 只表示“此刻查不到”，
+     那么本演示在哪种真实故障下会重复扣款？
+
+- **学习者原回答摘要**：3B 收尾阶段未答题（排期见下一轮）。
+
+- **纠偏与仍未理解的部分**：本轮暴露的是**交付纪律**问题，不是理解问题：规格里的每个约束
+  （传 `Path`、注册不能重名、幂等键取 `ctx.step_key`）都能在写的时候被 2 秒的 `mypy` 或一次执行
+  发现，但直到 Agent 跑了一次才被暴露。下一轮起把“交付前自己跑一遍”列为硬性前置。
+
+- **债务**：
+  1. `lookup` 不区分记录类型 → 第 6 轮对账工具。
+  2. 对账逻辑只存在于演示脚本，引擎自己不会在 UNCERTAIN 后主动对账 → 第 6 轮。
+  3. `validate` 崩溃与参数不合法共用 `kind=invalid_args` → 第 7 轮时间线。
+  4. `run` 返回非 Mapping 未校验 → 第 4 轮结果落盘前。
+  5. 前几轮遗留：`args` 共享引用、`RUN_FAILED` 原因未进视图、`replay` 信任顺序、账本无版本号、
+     读改写无锁、CI 未远端运行、Docker 未触发。
+
+- **本轮状态**：3A、3B 实现与验证完成；**复盘待进行**（两道架构问题未答）。
