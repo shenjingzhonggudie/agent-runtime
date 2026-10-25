@@ -18,12 +18,19 @@ from .events import Event, EventType
 
 
 class RunStatus(StrEnum):
-    """任务级状态。终态只有三种，且都不可再回到 RUNNING。"""
+    """任务级状态。
+
+    ``WAITING_REVIEW`` 是**暂停**而不是终态：任务停在原地等人给结论，之后还能回到
+    ``RUNNING`` 或被终止。终态有四种（``SUCCEEDED`` / ``FAILED`` / ``EXHAUSTED`` /
+    ``ABORTED``），一旦进入就不能再追加任何事件。
+    """
 
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     EXHAUSTED = "EXHAUSTED"
+    WAITING_REVIEW = "WAITING_REVIEW"
+    ABORTED = "ABORTED"
 
 
 class Outcome(StrEnum):
@@ -43,6 +50,16 @@ class InvalidEvent(Exception):
 
     抛出它表示“这条事件不能进入日志”，而不是“工具执行失败”。
     """
+
+
+REVIEW_DECISIONS: tuple[str, ...] = ("applied", "not_applied", "abort")
+"""人工复核允许的三种结论。
+
+- ``applied``：查实已生效，补记结果，任务回到 ``RUNNING``。
+- ``not_applied``：查实未生效且不会再生效，该步记为失败，任务回到 ``RUNNING``，
+  由策略决定是否重做（重做是新的步骤、新的 ``step_key``）。
+- ``abort``：证据不足或业务放弃，任务进入终态 ``ABORTED``，不再执行。
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +92,24 @@ class StepView:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewView:
+    """最近一次人工复核记录。
+
+    Attributes:
+        step: 被复核的步骤号。
+        reason: 为什么进入复核（来自 ``REVIEW_REQUESTED``）。
+        decision: 复核结论；``None`` 表示仍在等待。取值 ``applied`` / ``not_applied``
+            / ``abort``。
+        note: 复核依据；等待中为 ``None``。
+    """
+
+    step: int
+    reason: str
+    decision: str | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RunView:
     """任务的当前状态，完全由事件推出；不含任何无法从事件重建的字段。
 
@@ -88,6 +123,8 @@ class RunView:
             两个编号不同步。
         steps: 已决策的步骤，按 step 升序。
         answer: 成功时的最终答案；其他情况为 None。
+        review: 最近一次人工复核记录；从未请求过复核时为 None。``decision`` 为
+            None 表示仍在等待，此时 ``status`` 必为 ``WAITING_REVIEW``。
     """
 
     run_id: str
@@ -97,6 +134,7 @@ class RunView:
     last_seq: int = 0
     steps: tuple[StepView, ...] = ()
     answer: str | None = None
+    review: ReviewView | None = None
 
 
 def _field(event: Event, name: str, kind: type | tuple[type, ...]) -> Any:
@@ -143,11 +181,18 @@ def apply(view: RunView | None, event: Event) -> RunView:
             ``max_steps`` 为负；payload 缺少必需字段或类型不符；在终态之后追加
             事件；``step`` 与已有步骤不连续；``STEP_STARTED`` 的 ``attempt``
             不等于 ``attempts + 1``；结果事件之前没有对应的 ``STEP_STARTED``；
-            同一步骤出现第二个结果；``RUN_SUCCEEDED`` 的 answer 去空白后为空。
+            同一步骤出现第二个结果；``RUN_SUCCEEDED`` 的 answer 去空白后为空；
+            等待复核时追加非 ``REVIEW_RESOLVED`` 的事件；
+            ``REVIEW_REQUESTED`` 指向的步骤不是「已开始、无结果」；
+            ``REVIEW_RESOLVED`` 的 step、decision、note、result 与契约不符。
 
     Notes:
         预算耗尽（RUN_EXHAUSTED）不是成功，也不能写入 answer；它和 RUN_FAILED
         一样是独立的终态。工具执行与否由 engine 决定，model 只判断事件形状与顺序。
+
+        ``WAITING_REVIEW`` 是暂停态：除 ``REVIEW_RESOLVED`` 外不接受任何事件；复核
+        结论落地后要么回到 ``RUNNING``（applied / not_applied），要么进入终态
+        ``ABORTED``。
     """
     if view is None:
         if event.type != "RUN_STARTED":
@@ -167,10 +212,12 @@ def apply(view: RunView | None, event: Event) -> RunView:
             steps=(),
             answer=None,
         )
-    if view.status != RunStatus.RUNNING:
+    if view.status is not RunStatus.RUNNING and view.status is not RunStatus.WAITING_REVIEW:
         raise InvalidEvent(f"任务已处于终态 {view.status}，不能再追加事件：{event.type}")
     if event.seq != view.last_seq + 1:
         raise InvalidEvent(f"事件的 seq 必须是上一条的 seq + 1，当前为 {event.seq}")
+    if view.status is RunStatus.WAITING_REVIEW and event.type is not EventType.REVIEW_RESOLVED:
+        raise InvalidEvent(f"任务在等待人工复核，只接受 REVIEW_RESOLVED：{event.type}")
 
     if event.type == EventType.STEP_DECIDED:
         step = _field(event, "step", int)
@@ -222,6 +269,70 @@ def apply(view: RunView | None, event: Event) -> RunView:
     if event.type == EventType.RUN_EXHAUSTED:
         _field(event, "max_steps", int)
         return replace(view, last_seq=event.seq, status=RunStatus.EXHAUSTED, answer=None)
+
+    if event.type == EventType.REVIEW_REQUESTED:
+        step = _field(event, "step", int)
+        reason = _field(event, "reason", str)
+        if not reason.strip():
+            raise InvalidEvent("REVIEW_REQUESTED 的 reason 去空白后为空")
+        pending = next(
+            (item.step for item in view.steps if item.attempts > 0 and item.outcome is None),
+            None,
+        )
+        if pending != step:
+            raise InvalidEvent(f"步骤 {step} 不是待复核的步骤")
+        return replace(
+            view,
+            last_seq=event.seq,
+            status=RunStatus.WAITING_REVIEW,
+            review=ReviewView(step=step, reason=reason),
+        )
+
+    if event.type == EventType.REVIEW_RESOLVED:
+        review = view.review
+        if view.status is not RunStatus.WAITING_REVIEW or review is None:
+            raise InvalidEvent("只有在等待复核时才能给出复核结论")
+        step = _field(event, "step", int)
+        if step != review.step:
+            raise InvalidEvent(f"复核结论的 step 必须是 {review.step}，当前为 {step}")
+        decision = _field(event, "decision", str)
+        if decision not in REVIEW_DECISIONS:
+            raise InvalidEvent(f"未知的复核结论：{decision!r}")
+        note = _field(event, "note", str)
+        if not note.strip():
+            raise InvalidEvent("REVIEW_RESOLVED 的 note 去空白后为空")
+
+        current = _step_at(view, step)
+        if current.attempts == 0 or current.outcome is not None:
+            raise InvalidEvent(f"步骤 {step} 不需要复核结论")
+        resolved = replace(review, decision=decision, note=note)
+
+        if decision == "abort":
+            if "result" in event.payload:
+                raise InvalidEvent("终止任务时不能携带 result")
+            return replace(view, last_seq=event.seq, status=RunStatus.ABORTED, review=resolved)
+
+        if decision == "not_applied":
+            if "result" in event.payload:
+                raise InvalidEvent("确定未生效时不能携带 result")
+            failed = replace(
+                current,
+                outcome=Outcome.FAILED,
+                error={"kind": "reviewed_not_applied", "message": note},
+            )
+            return replace(
+                _with_step(view, event.seq, failed),
+                status=RunStatus.RUNNING,
+                review=resolved,
+            )
+
+        result = _field(event, "result", Mapping)
+        completed = replace(current, outcome=Outcome.SUCCEEDED, result=result)
+        return replace(
+            _with_step(view, event.seq, completed),
+            status=RunStatus.RUNNING,
+            review=resolved,
+        )
 
     raise InvalidEvent(f"当前位置不允许事件 {event.type}")
 

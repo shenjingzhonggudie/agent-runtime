@@ -16,6 +16,10 @@
 - ``RUN_SUCCEEDED``：``answer: str``（去空白后不得为空）
 - ``RUN_FAILED``：``reason: str``
 - ``RUN_EXHAUSTED``：``max_steps: int``
+- ``REVIEW_REQUESTED``：``step: int``、``reason: str``（去空白后不得为空）
+- ``REVIEW_RESOLVED``：``step: int``、``decision: str``（``applied`` / ``not_applied`` /
+  ``abort``）、``note: str``（去空白后不得为空）；``decision == "applied"`` 时另带
+  ``result: dict``，其余决策不得携带
 
 顺序约定：``seq`` 从 1 开始连续递增，是唯一的排序依据；``at`` 只供人阅读，
 不参与任何判定（时钟回拨、时区差异都不该改变重放结果）。
@@ -39,6 +43,8 @@ class EventType(StrEnum):
     RUN_SUCCEEDED = "RUN_SUCCEEDED"
     RUN_FAILED = "RUN_FAILED"
     RUN_EXHAUSTED = "RUN_EXHAUSTED"
+    REVIEW_REQUESTED = "REVIEW_REQUESTED"
+    REVIEW_RESOLVED = "REVIEW_RESOLVED"
 
 
 @dataclass(frozen=True, slots=True)

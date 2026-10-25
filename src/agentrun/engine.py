@@ -25,12 +25,17 @@ class StopReason(StrEnum):
 
     FAILED 有两种来源，都满足「零副作用」：工具名未注册（配置错误）与策略给不出动作
     （``PolicyError``）。不要把它们记成 UNCERTAIN——那只留给定不下来的时候。
+
+    ``WAITING_REVIEW`` 与 ``ABORTED`` 来自日志里的复核记录：引擎自己不请求复核，
+    只在 ``resume`` 时把状态原样带回，让调用方知道「这里需要人」还是「已经放弃了」。
     """
 
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     EXHAUSTED = "EXHAUSTED"
     UNCERTAIN = "UNCERTAIN"
+    WAITING_REVIEW = "WAITING_REVIEW"
+    ABORTED = "ABORTED"
 
 
 class NothingToResume(Exception):
@@ -114,14 +119,17 @@ class Engine:
             InvalidEvent: 日志内容非法（编程错误或存储损坏，不应在正常运行中出现）。
 
         Notes:
-            三种停止情形，都不追加任何事件：
+            四种停止情形，都不追加任何事件：
 
-            1. 视图已是终态 → 原样返回，``stop_reason`` 由状态推出。
-            2. 最后一步已 ``STEP_STARTED`` 但没有结果 → 返回 ``UNCERTAIN``。外部世界
+            1. 视图已是终态（成功 / 失败 / 预算耗尽 / 人工终止）→ 原样返回，
+               ``stop_reason`` 由状态推出。
+            2. 视图在等待人工复核 → 返回 ``WAITING_REVIEW``。复核结论只能由
+               ``reconcile.resolve`` 写，引擎不能替人猜。
+            3. 最后一步已 ``STEP_STARTED`` 但没有结果 → 返回 ``UNCERTAIN``。外部世界
                可能已经改变，既不能重做也不能跳过，必须先用对账补记结果。
-            3. 其余情况 → 交给 ``_drive`` 继续。
+            4. 其余情况 → 交给 ``_drive`` 继续。
 
-            第 2 条是这一层最重要的判断：宁可停着不动，也不用“重试一次看看”去赌一个
+            第 3 条是这一层最重要的判断：宁可停着不动，也不用“重试一次看看”去赌一个
             非幂等调用没有生效。
         """
         events = self._log.read(run_id)

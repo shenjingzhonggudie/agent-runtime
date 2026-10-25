@@ -176,3 +176,87 @@ def test_trace_of_unknown_run_returns_2(tmp_path: Path, capsys: pytest.CaptureFi
 
     assert code == 2
     assert "没有这个任务" in capsys.readouterr().out
+
+
+def seed_crash_window(tmp_path: Path) -> None:
+    """直接写日志，造一个「第 1 步已开始、没有结果」的现场。"""
+    from agentrun.events import EventType, make_step_key
+    from agentrun.journal import SqliteEventLog
+
+    log = SqliteEventLog(tmp_path / "events.db")
+    run_id = "r1"
+    log.append(run_id, EventType.RUN_STARTED, {"task": "转账", "max_steps": 5})
+    log.append(
+        run_id,
+        EventType.STEP_DECIDED,
+        {
+            "step": 1,
+            "tool": "transfer",
+            "args": {"src": "alice", "dst": "bob", "amount": 250},
+            "step_key": make_step_key(run_id, 1),
+        },
+    )
+    log.append(run_id, EventType.STEP_STARTED, {"step": 1, "attempt": 1})
+
+
+def test_reconcile_miss_then_resolve_then_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_crash_window(tmp_path)
+
+    code = main(["reconcile", "--run-id", "r1", *base_args(tmp_path)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "已提交人工复核" in out
+    assert "等待复核" in out
+
+    code = main(
+        [
+            "resolve",
+            "--run-id",
+            "r1",
+            "--decision",
+            "applied",
+            "--note",
+            "账本记录与 step_key 一致",
+            "--result",
+            '{"found": true, "amount": 250}',
+            *db_only(tmp_path),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "applied" in out
+
+    script = write_script(tmp_path / "s.json", [{"finish": "占位"}, {"finish": "复核后结束"}])
+    code = main(["resume", "--run-id", "r1", "--script", str(script), *base_args(tmp_path)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "复核后结束" in out
+
+
+def test_resolve_without_review_returns_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = write_script(
+        tmp_path / "s.json",
+        [{"tool": "get_balance", "args": {"owner": "alice"}}, {"finish": "余额充足"}],
+    )
+    main(["run", "--run-id", "r1", "--script", str(script), *base_args(tmp_path)])
+    capsys.readouterr()
+
+    code = main(
+        [
+            "resolve",
+            "--run-id",
+            "r1",
+            "--decision",
+            "abort",
+            "--note",
+            "无需复核",
+            *db_only(tmp_path),
+        ]
+    )
+
+    assert code == 2
+    assert "无法复核" in capsys.readouterr().out

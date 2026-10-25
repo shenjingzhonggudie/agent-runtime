@@ -11,7 +11,7 @@ from agentrun.engine import Engine, StopReason
 from agentrun.events import EventType, make_step_key
 from agentrun.journal import MemoryEventLog
 from agentrun.ledger_tools import LookupRequest
-from agentrun.model import Outcome, replay
+from agentrun.model import Outcome, RunStatus, replay
 from agentrun.policy import Finish, ScriptedPolicy
 from agentrun.reconcile import NothingToReconcile, pending_step, reconcile
 from agentrun.tools import SideEffect, ToolContext, ToolRegistry
@@ -98,18 +98,19 @@ def test_reconcile_records_completion_when_ledger_has_the_record(tmp_path: Path)
     assert view.steps[0].result["found"] is True
 
 
-def test_reconcile_writes_nothing_when_ledger_has_no_record(tmp_path: Path) -> None:
+def test_reconcile_missing_record_requests_review_without_guessing(tmp_path: Path) -> None:
+    # 查不到不等于没生效：不补记成功，也不补记失败，只把决定权交给人
     log = MemoryEventLog()
     seed_pending(log)
-    before = log.read(RUN)
 
     result = reconcile(log, RUN, LookupRequest(make_ledger(tmp_path)))
 
+    view = replay(log.read(RUN))
     assert result.recorded is False
-    assert result.event is None
+    assert result.requested is True
     assert "无法确认" in result.detail
-    assert log.read(RUN) == before
-    assert replay(log.read(RUN)).steps[0].outcome is None
+    assert view.status is RunStatus.WAITING_REVIEW
+    assert view.steps[0].outcome is None
 
 
 def test_resume_continues_after_reconcile(tmp_path: Path) -> None:

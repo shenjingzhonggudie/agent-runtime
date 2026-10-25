@@ -20,7 +20,7 @@ def ev(seq: int, type_: EventType, **payload: Any) -> Event:
 
 
 def sample_events() -> list[Event]:
-    """九种事件各一条，顺序合法。"""
+    """十一种事件各一条，覆盖全部 EventType。"""
     return [
         ev(1, EventType.RUN_STARTED, task="转账", max_steps=5),
         ev(
@@ -35,9 +35,11 @@ def sample_events() -> list[Event]:
         ev(4, EventType.STEP_COMPLETED, step=1, result={"ok": True}),
         ev(5, EventType.STEP_FAILED, step=2, error={"kind": "rejected", "message": "余额不足"}),
         ev(6, EventType.STEP_UNCERTAIN, step=3, reason="连接中断"),
-        ev(7, EventType.RUN_SUCCEEDED, answer="完成"),
-        ev(8, EventType.RUN_FAILED, reason="配置错误"),
-        ev(9, EventType.RUN_EXHAUSTED, max_steps=5),
+        ev(7, EventType.REVIEW_REQUESTED, step=3, reason="账本查不到"),
+        ev(8, EventType.REVIEW_RESOLVED, step=3, decision="applied", note="人工核对到记录"),
+        ev(9, EventType.RUN_SUCCEEDED, answer="完成"),
+        ev(10, EventType.RUN_FAILED, reason="配置错误"),
+        ev(11, EventType.RUN_EXHAUSTED, max_steps=5),
     ]
 
 

@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 8 轮完成）
+> 最后更新：2026-10-25（第 9 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 8 轮完成：模型输出可解析成动作，决策失败与「可能已生效」彻底分开 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 五个子命令 |
-| 未实现能力 | 真实模型服务调用（需联网与密钥）；提示长度预算 |
+| 当前里程碑 | 第 9 轮完成：自动对账查不到时进入人工复核，三种结论都可落地并续跑 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 六个子命令 |
+| 未实现能力 | 真实模型服务调用（需联网与密钥）；提示长度预算；多 worker 接管 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -27,12 +27,13 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
 │  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
 │  ├─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
-│  └─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
+│  ├─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
+│  └─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
 │  ├─ events.py              事件契约：EventType / Event / make_step_key
-│  ├─ model.py               RunStatus / Outcome / InvalidEvent / StepView / RunView / apply / replay
+│  ├─ model.py               RunStatus / Outcome / ReviewView / InvalidEvent / StepView / RunView / apply / replay
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
 │  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
@@ -40,7 +41,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
 │  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
-│  ├─ reconcile.py           ReconcileResult / NothingToReconcile / pending_step / reconcile
+│  ├─ reconcile.py           ReconcileResult / NothingToReconcile / NothingToResolve / pending_step / reconcile / resolve
 │  ├─ trace.py               TraceLine / summarize / timeline / export_jsonl（只读观察）
 │  └─ cli.py                 argparse 入口：run / resume / status / reconcile / trace
 └─ tests/
@@ -56,8 +57,9 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止、决策失败
    ├─ test_engine_resume.py     续跑：终态不重跑、未完成步骤先对账、预算取自日志
    ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
-   ├─ test_reconcile.py         对账：查到才补记、查不到保持未知、补记后可续跑
-   ├─ test_trace.py             时间线：九种事件可渲染、JSONL 可回读、不修改原事件
+   ├─ test_reconcile.py         对账：查到才补记、查不到提交复核、补记后可续跑
+   ├─ test_review.py            复核：暂停态、三种结论、重复复核、续跑闸门
+   ├─ test_trace.py             时间线：十一种事件可渲染、JSONL 可回读、不修改原事件
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
 
@@ -70,14 +72,15 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `EventType` | — | 9 个枚举值 | 字符串值即日志稳定标识，改名等于破坏兼容 |
+| `EventType` | — | 11 个枚举值 | 字符串值即日志稳定标识，改名等于破坏兼容 |
 | `Event` | `run_id, seq, type, payload, at` | 冻结 dataclass | `seq` 从 1 连续递增，唯一排序依据；`at` 仅展示 |
 | `make_step_key(run_id, step)` | 任务 id、步骤号 | `"<run_id>:<step>"` | **不含 attempt**，重试间稳定，工具端去重靠它 |
 
 payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,step_key}`、
 `STEP_STARTED{step,attempt}`、`STEP_COMPLETED{step,result}`、`STEP_FAILED{step,error}`、
 `STEP_UNCERTAIN{step,reason}`、`RUN_SUCCEEDED{answer}`、`RUN_FAILED{reason}`、
-`RUN_EXHAUSTED{max_steps}`。
+`RUN_EXHAUSTED{max_steps}`、`REVIEW_REQUESTED{step,reason}`、
+`REVIEW_RESOLVED{step,decision,note[,result]}`。
 
 ### 3.2 视图（`model.py`）
 
@@ -85,9 +88,10 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 |---|---|---|---|
 | `apply(view, event)` | 当前视图或 `None`、事件 | 新 `RunView` | 纯函数，不修改入参；非法抛 `InvalidEvent` |
 | `replay(events)` | 事件可迭代对象 | `RunView` | 等价于依次 `apply`；空序列抛 `InvalidEvent` |
-| `RunView` | — | 冻结 dataclass | `run_id, task, max_steps, status, last_seq, steps, answer` |
+| `RunView` | — | 冻结 dataclass | `run_id, task, max_steps, status, last_seq, steps, answer, review` |
 | `StepView` | — | 冻结 dataclass | `step, tool, args, step_key, attempts, outcome, result, error, reason` |
-| `RunStatus` | — | 4 值枚举 | `RUNNING / SUCCEEDED / FAILED / EXHAUSTED`，后三者不可逆 |
+| `ReviewView` | — | 冻结 dataclass | `step, reason, decision, note`；`decision is None` 表示仍在等待 |
+| `RunStatus` | — | 6 值枚举 | `RUNNING / WAITING_REVIEW / SUCCEEDED / FAILED / EXHAUSTED / ABORTED`；后四者不可逆，`WAITING_REVIEW` 是暂停态 |
 | `Outcome` | — | 3 值枚举 | `SUCCEEDED / FAILED / UNCERTAIN` |
 
 **关键不变量**：
@@ -98,6 +102,11 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 4. `STEP_STARTED` 的 `attempt` 必须等于 `attempts + 1`；有结果后不得再开始。
 5. 结果事件必须先有 `STEP_STARTED`（`attempts >= 1`），且该步还没有结果。
 6. `RUN_SUCCEEDED` 的 `answer` 去空白后不得为空；`RUN_EXHAUSTED` 不得携带答案。
+7. 只有 `RUNNING` 能进入 `WAITING_REVIEW`，且 `REVIEW_REQUESTED` 的 `step` 必须是
+   「已开始、无结果」的那一步；进入后除 `REVIEW_RESOLVED` 外不接受任何事件。
+8. `REVIEW_RESOLVED` 的 `step` 必须等于待复核步骤；`note` 去空白后不得为空；
+   `applied` 必须带 `result`，`not_applied` / `abort` 不得带。`applied` /
+   `not_applied` 回到 `RUNNING`，`abort` 进入终态 `ABORTED` 且不改变该步 `outcome`。
 
 ### 3.3 模拟账本（`demo.py`）
 
@@ -210,33 +219,59 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 | `Engine.resume(run_id)` | 已存在的任务 | `EngineResult` | 不写 `RUN_STARTED`，预算取 `view.max_steps` |
 | `NothingToResume` | — | 异常 | 日志里没有该任务的任何事件 |
 
-**续跑的三种分支**（都不追加事件）：
+**续跑的四种分支**（都不追加事件）：
 
-1. 视图已是终态 → 原样返回，`stop_reason` 由状态推出。
-2. 最后一步 `STEP_STARTED` 但没有结果 → 返回 `UNCERTAIN`。外部世界可能已经改变，
+1. 视图已是终态（`SUCCEEDED` / `FAILED` / `EXHAUSTED` / `ABORTED`）→ 原样返回，
+   `stop_reason` 由状态推出。
+2. 视图在 `WAITING_REVIEW` → 返回 `WAITING_REVIEW`。结论只能由 `resolve` 写入，
+   引擎不替人猜。
+3. 最后一步 `STEP_STARTED` 但没有结果 → 返回 `UNCERTAIN`。外部世界可能已经改变，
    既不能重做也不能跳过，必须先对账。
-3. 其余 → 继续主循环。
+4. 其余 → 继续主循环。
 
-第 2 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
+第 3 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
 
 **决策失败**：`policy.decide` 抛 `PolicyError`（`ScriptExhausted` 也是它）→ 追加
 `RUN_FAILED`，停止，原因 `FAILED`。此时一条 `STEP_DECIDED` 都没有，因此可以断言零副作用；
 不能记成 `UNCERTAIN`——那个状态只留给「可能已经改了」。
 
-### 3.9 对账（`reconcile.py`）
+### 3.9 对账与人工复核（`reconcile.py`）
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
 | `pending_step(view)` | 视图 | `int \| None` | 第一个「已开始、无结果」的步骤号 |
-| `reconcile(log, run_id, lookup)` | 日志、任务、只读查询工具 | `ReconcileResult` | 查到就补记，查不到不写 |
-| `NothingToReconcile` | — | 异常 | 没有待对账的步骤 |
+| `reconcile(log, run_id, lookup)` | 日志、任务、只读查询工具 | `ReconcileResult` | 查到补记；查不到提交复核；查询失败不写 |
+| `resolve(log, run_id, *, decision, note, result=None)` | 日志、任务、结论、依据、可选事实 | `RunView` | 写入 `REVIEW_RESOLVED`，返回复核后的视图 |
+| `NothingToReconcile` | — | 异常 | 当前不该自动对账：终态、已在复核、或没有待定步骤 |
+| `NothingToResolve` | — | 异常 | 当前不该复核：不在 `WAITING_REVIEW`，或结论已经写过 |
 
-**三条走向**：
+`ReconcileResult` 字段：`recorded`（补记成功）、`requested`（提交复核）、`event`
+（本次追加的事件）、`detail`（给人看的原因）。
+
+**对账的四条走向**：
 
 1. `found=True` → 追加 `STEP_COMPLETED`，该步变为成功；携带的是**账本记录**，不是原
    工具返回值（后者随进程一起丢了）。
-2. `found=False` → **不写任何事件**。查不到只说明此刻查不到，不能据此断言未生效。
-3. 查询失败 → 同样不写，原因写进 `detail`。
+2. `found=False` → 追加 `REVIEW_REQUESTED`，进入 `WAITING_REVIEW`。查不到只说明此刻
+   查不到，不能据此断言未生效；把它升级成「需要人给结论」，是因为自动手段已经用尽。
+3. 查询本身失败 → 不写事件，原因写进 `detail`。查询失败连「查不到」都证明不了。
+4. 任务不是 `RUNNING` → `NothingToReconcile`。
+
+**复核的三种结论**（`REVIEW_DECISIONS`）：
+
+| 结论 | 对日志的影响 | 任务状态 | 后续 |
+|---|---|---|---|
+| `applied` | 该步 `STEP_COMPLETED`，`result` 为查实的外部事实 | 回 `RUNNING` | 续跑从下一步继续 |
+| `not_applied` | 该步 `STEP_FAILED`，`kind=reviewed_not_applied` | 回 `RUNNING` | 是否重做由策略决定；重做是新步骤、新 `step_key` |
+| `abort` | 不改变该步 `outcome` | 终态 `ABORTED` | `resume` 直接返回 `ABORTED` |
+
+**不变量**：
+
+1. 一次复核只处理一个步骤；重复 `resolve` 抛 `NothingToResolve`，不覆盖第一次的结论。
+2. `note` 是必填的复核依据；空白的「依据」等于没有依据。
+3. `not_applied` 之后的重做**不能**复用原 `step_key`：那会把第二次调用伪装成第一次的
+   重试，工具端若按幂等键去重就会吞掉真实的第二次业务。
+4. `abort` 不猜测该步是否生效；「不再继续」与「确定没发生」是两件事。
 
 ### 3.10 CLI（`cli.py`）
 
@@ -245,7 +280,8 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 | `run` | `--run-id --script [--task] [--max-steps]` | 0 成功 / 1 失败或耗尽 / 2 参数或脚本错 |
 | `resume` | `--run-id --script` | 同上；任务不存在时 2 |
 | `status` | `--run-id` | 0 / 任务不存在时 2 |
-| `reconcile` | `--run-id` | 0 已补记 / 2 无法确认或无需对账 |
+| `reconcile` | `--run-id` | 0 已补记或已提交复核 / 2 查询失败或无需对账 |
+| `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON]` | 0 已写入 / 2 没有待复核或参数错 |
 
 公共参数 `--db`（默认 `agentrun.db`）与 `--ledger`（默认 `ledger`）。
 
@@ -364,14 +400,19 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D31 | 模型输出解析 | 严格：不剥代码块、不截取花括号、不转类型 | 2026-10-25 | 容错会让“没按约定输出”变成“有时能跑”，日志里看不出差别；代价是真模型首次接入会在格式上失败几次 |
 | D32 | 工具是否存在的判定位置 | 仍由引擎判（`UnknownTool`），`llm` 不查注册表 | 2026-10-25 | 只有注册表知道答案；策略多查一次就会造出第二份“哪些工具可用”的事实 |
 | D33 | `ScriptExhausted` 的归属 | 继承 `PolicyError` | 2026-10-25 | 脚本用完与模型乱输出是同一类事：给不出动作。统一之后 CLI 由栈信息变成 `RUN_FAILED`（退出码 1） |
+| D34 | 分工变更 | 学习者只读，Agent 代行决策与全部实现；等待点 A/B/C 取消 | 2026-10-25 | 学习者明确要求「整个项目全部由你来完成，我最后会阅读全部内容」；代价是失去逐轮复盘的即时纠偏，改为文档留痕 |
+| D35 | 复核结论取值 | `applied` / `not_applied` / `abort` 三值，存字符串不建枚举 | 2026-10-25 | 事件 payload 里存字符串便于日志兼容；三值各有互斥的后续动作，多一个值就多一条状态分支 |
+| D36 | `WAITING_REVIEW` 的性质 | 暂停态，不是终态 | 2026-10-25 | 等人给结论之后任务还要继续；设成终态就必须再开一个 run，日志会断成两截 |
+| D37 | 自动对账查不到时的动作 | 追加 `REVIEW_REQUESTED` 进入复核 | 2026-10-25 | 第 6 轮是「不写」，把不知道留在原地；现在自动手段用尽，把它升级成「需要人」才是闭环。代价是每次查不到都会产生一条待办 |
+| D38 | `not_applied` 之后的重做 | 新步骤、新 `step_key`，不复用原键 | 2026-10-25 | 复用键会让工具端把第二次业务当第一次的重试而吞掉；代价是日志里同一次业务意图出现两次 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 236 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 258 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（37 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（39 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（14 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -381,20 +422,19 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 8 轮完成）
+- 时间：2026-10-25（第 9 轮完成）
 - 命令与结果：
-  - `pytest` → `236 passed`（新增 36 例：`test_llm.py` 33 例、引擎 2 例、策略 1 例）
+  - `pytest` → `258 passed`（新增 22 例：`test_review.py` 18 例、CLI 2 例、对账改写 1 例、
+    时间线扩到 11 种事件）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `37 files already formatted`
+  - `ruff format --check .` → `39 files already formatted`
   - `mypy` → `Success: no issues found in 14 source files`
-  - `python scripts/model_policy_demo.py` → 退出码 0：场景 A 三份提示、8 条事件、
-    `SUCCEEDED`、余额 `750/250`；场景 B 只有 `RUN_STARTED` + `RUN_FAILED`、0 步、
-    余额 `1000/0`；场景 C 崩在第 1 步之后，重启后提示指纹同为 `6fec2dbedd27`，
-    续跑至 `SUCCEEDED`、余额 `750/250`
-  - `python -m agentrun.cli run`（脚本 `get_balance` + `finish`）→ `SUCCEEDED`，
-    退出码 0
-  - 同一 CLI 用只含 1 步的脚本跑新任务 → `RUN_FAILED`、退出码 1；改动前是未捕获的
-    `ScriptExhausted`
+  - `python scripts/review_demo.py` → 退出码 0：场景 A 自动对账查不到 → `WAITING_REVIEW`
+    → `not_applied` → 续跑把转账作为第 2 步重做，9 条事件、`SUCCEEDED`、余额
+    `750/250`；场景 B 复核 `abort` → `ABORTED`，再次 `resume` 不追加事件、余额
+    `1000/0`
+  - CLI 端到端：seeded 崩溃现场 → `reconcile` 退出码 0（已提交复核）→ `resolve
+    --decision applied` 退出码 0 → `resume` 退出码 0、答案写入视图
 - 未验证：CI 远端运行、真实模型服务、多进程并发
 
 ### 第 4 轮新增证据
@@ -420,7 +460,9 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
-| `reconcile` 只能补记成功 | 查到记录才有补记路径；判定「确实没生效」需要别的证据来源 | 需要人工判定失败时 |
+| 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
+| 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
+| 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
 | 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
 | 提示没有长度预算 | 长 `result` 会把提示撑大，可能超出上下文 | 结果变长或接真实服务时 |
 | CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
@@ -434,3 +476,4 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
 | `model_client.py` | 真实模型客户端：HTTP、密钥、超时与重试策略 | 决定接真实服务时 |
+| `lease.py` | owner、租约、心跳、epoch 与条件写入（日志 fencing） | v2：多 worker 接管 |

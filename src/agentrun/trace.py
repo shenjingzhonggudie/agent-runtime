@@ -65,6 +65,13 @@ def summarize(event: Event) -> str:
         return f"任务成功：{payload.get('answer', '')}"
     if kind is EventType.RUN_FAILED:
         return f"任务失败：{payload.get('reason', '')}"
+    if kind is EventType.REVIEW_REQUESTED:
+        return f"第 {payload.get('step')} 步提交人工复核：{payload.get('reason', '')}"
+    if kind is EventType.REVIEW_RESOLVED:
+        return (
+            f"第 {payload.get('step')} 步复核结论："
+            f"{payload.get('decision')}（{payload.get('note', '')}）"
+        )
     return f"预算耗尽（上限 {payload.get('max_steps')} 步）"
 
 

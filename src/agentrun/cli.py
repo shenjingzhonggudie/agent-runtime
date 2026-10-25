@@ -1,11 +1,12 @@
 """命令行入口：把已有模块组装成可执行命令。
 
-五个子命令，各自只做一件事：
+六个子命令，各自只做一件事：
 
 - ``run``：从 JSON 脚本跑一个新任务。
 - ``resume``：在已有日志上继续跑。
 - ``status``：打印视图与每一步的当前状态。
-- ``reconcile``：为悬空的那一步补记结论。
+- ``reconcile``：为悬空的那一步补记结论；查不到则提交人工复核。
+- ``resolve``：写下人工复核结论（applied / not_applied / abort）。
 - ``trace``：打印时间线，或把事件导出成 JSONL。
 
 本入口只装配 ``ScriptedPolicy``：它只依赖 ``len(view.steps)``，所以 ``resume`` 需要
@@ -21,14 +22,21 @@ import argparse
 import json
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .demo import Ledger
 from .engine import Engine, NothingToResume, StopReason
 from .journal import SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
-from .model import InvalidEvent, RunView, replay
+from .model import REVIEW_DECISIONS, InvalidEvent, RunView, replay
 from .policy import Action, Finish, ScriptedPolicy, ToolCall
-from .reconcile import NothingToReconcile, pending_step, reconcile
+from .reconcile import (
+    NothingToReconcile,
+    NothingToResolve,
+    pending_step,
+    reconcile,
+    resolve,
+)
 from .tools import ToolRegistry
 from .trace import export_jsonl, timeline
 
@@ -107,8 +115,14 @@ def print_view(view: RunView) -> None:
     for step in view.steps:
         outcome = step.outcome.value if step.outcome is not None else "-"
         print(f"  {step.step:>2}  {step.tool:<14} attempts={step.attempts} outcome={outcome}")
+    if view.review is not None:
+        review = view.review
+        if review.decision is None:
+            print(f"复核：step {review.step} 等待人工结论（{review.reason}）")
+        else:
+            print(f"复核：step {review.step} → {review.decision}（{review.note}）")
     pending = pending_step(view)
-    if pending is not None:
+    if pending is not None and view.review is None:
         print(f"待对账：step {pending}（已开始，没有结果）")
 
 
@@ -175,9 +189,41 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(f"无需对账：{exc}")
         return 2
     print(result.detail)
-    if not result.recorded:
+    if result.recorded:
+        print_view(replay(log.read(args.run_id)))
+        return 0
+    if result.requested:
+        print("任务已进入等待复核：用 resolve 给出结论")
+        return 0
+    return 2
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    """执行 ``resolve`` 子命令。"""
+    result: dict[str, Any] | None = None
+    if args.result is not None:
+        try:
+            parsed = json.loads(args.result)
+        except ValueError as exc:
+            raise ValueError(f"--result 不是合法 JSON：{exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--result 必须是 JSON 对象")
+        result = parsed
+
+    log = SqliteEventLog(args.db)
+    try:
+        view = resolve(
+            log,
+            args.run_id,
+            decision=args.decision,
+            note=args.note,
+            result=result,
+        )
+    except NothingToResolve as exc:
+        print(f"无法复核：{exc}")
         return 2
-    print_view(replay(log.read(args.run_id)))
+
+    print_view(view)
     return 0
 
 
@@ -228,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
     recon_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     recon_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     recon_p.set_defaults(func=cmd_reconcile)
+
+    resolve_p = sub.add_parser("resolve", help="写下人工复核结论")
+    resolve_p.add_argument("--run-id", required=True)
+    resolve_p.add_argument("--decision", required=True, choices=REVIEW_DECISIONS)
+    resolve_p.add_argument("--note", required=True, help="复核依据：谁、看了什么、为什么")
+    resolve_p.add_argument("--result", default=None, help="applied 时的外部事实（JSON 对象）")
+    resolve_p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    resolve_p.set_defaults(func=cmd_resolve)
 
     trace_p = sub.add_parser("trace", help="打印时间线或导出 JSONL")
     trace_p.add_argument("--run-id", required=True)
