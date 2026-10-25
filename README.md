@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第 11 轮完成：失败原因进了视图，提示有了确定性的长度上限。
+第 12 轮完成：有了真实模型客户端（标准库 HTTP），但从未联过真实服务。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -24,6 +24,8 @@
 - 离线评测集覆盖 8 种结局，打印每次的停止原因、步数、事件数、余额与耗时。
 - `RUN_FAILED` 的原因进入视图，`status` 直接打印「为什么失败」，不必再翻事件。
 - 提示里超长的参数与结果按 `field_limit`（默认 200 字）截断并标注截掉多少；截断是确定性的，同一视图仍渲染出同一份提示。
+- `HttpModelClient` 用标准库发 OpenAI 兼容请求：温度 0、不重试、超时即失败；错误信息不含密钥与提示。
+- 客户端只用本地 `http.server` 测过协议与坏响应；**没有真实服务凭据，真实兼容性未验证**。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 
@@ -95,6 +97,16 @@ policy = ModelPolicy(client, [ToolSpec("get_balance", "读取账户余额")])
 result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", max_steps=5)
 ```
 
+接真实服务（未验证，谨慎使用）：
+
+```powershell
+$env:AGENTRUN_BASE_URL = "https://api.example.com/v1"
+$env:AGENTRUN_API_KEY = "sk-..."
+$env:AGENTRUN_MODEL = "your-model"
+```
+
+`client_from_env()` 会读取这三个变量；缺任何一个都直接报错，不会静默用空密钥发请求。
+
 完整演示（假模型，不需要网络与密钥）：
 
 ```powershell
@@ -118,7 +130,7 @@ result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", ma
 ## 目录
 
 ```text
-src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器、日志、引擎、对账、CLI
+src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器与客户端、日志、引擎、对账、CLI
 tests/               契约测试
 scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核、进程级故障注入、评测集
 .github/workflows/   CI 配置

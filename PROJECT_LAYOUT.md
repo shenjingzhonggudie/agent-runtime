@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 11 轮完成）
+> 最后更新：2026-10-25（第 12 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 11 轮完成：失败原因进入视图，提示长度有确定性上限，v1 硬化收尾 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
-| 未实现能力 | 真实模型服务调用（需联网与密钥）；多 worker 接管 |
+| 当前里程碑 | 第 12 轮完成：真实模型客户端落地（离线协议测试），v1 功能闭环 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 未实现能力 | 真实模型服务联调（无凭据）；多 worker 接管 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -41,6 +41,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
 │  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
+│  ├─ model_client.py        ModelClientError / HttpModelClient / _extract_content / client_from_env
 │  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / NothingToResolve / pending_step / reconcile / resolve
@@ -56,6 +57,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_journal_sqlite.py    SQLite 日志：seq 连续、重开读回、原子回滚、并发不重号
    ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
    ├─ test_llm.py               模型策略：提示只由视图决定、输出严格解析、客户端失败
+   ├─ test_model_client.py      HTTP 客户端：请求形状、坏响应、超时、环境变量
    ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止、决策失败
    ├─ test_engine_resume.py     续跑：终态不重跑、未完成步骤先对账、预算取自日志
    ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
@@ -352,6 +354,28 @@ CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume
    确定性的——同一输入必得同一字符串，否则续跑时的提示会随长度漂移。
 6. 截断只发生在渲染层：日志、视图、工具参数都是原文，不做任何裁剪。
 
+### 3.13 模型客户端（`model_client.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `HttpModelClient(base_url, api_key, model, timeout=30)` | 地址、密钥、模型名、超时 | 客户端 | 实现 `ModelClient` 协议；`complete(prompt)` 返回文本 |
+| `ModelClientError` | — | 异常 | 没拿到可用输出：网络、HTTP 非 2xx、非 JSON、结构不符、超时 |
+| `client_from_env()` | 环境变量 | 客户端 | 读 `AGENTRUN_BASE_URL` / `AGENTRUN_API_KEY` / `AGENTRUN_MODEL`（`AGENTRUN_TIMEOUT` 可选） |
+
+**请求形状**：`POST {base_url}/chat/completions`，头 `Authorization: Bearer <key>`，
+体 `{model, messages:[{role:"user", content: prompt}], temperature: 0}`。
+
+**不变量**：
+
+1. 不重试、不流式、不解析动作：一次调用只报告这一次的成败。
+2. 错误信息不含密钥与提示：它们会进入 `RUN_FAILED.reason` 与日志。
+3. 温度固定 0：服务端不保证确定性，但请求必须表达「尽量稳定」。
+4. 只要响应结构不合约（`choices[0].message.content` 不是非空字符串），一律
+   `ModelClientError`，不猜测、不取别的字段。
+
+**验证边界**：测试只覆盖本地 `http.server`。没有真实服务凭据，兼容性（尤其
+`base_url` 是否要带 `/v1`、是否支持 `temperature`）未经真实联调。
+
 ## 4. 依赖方向
 
 ```text
@@ -361,7 +385,8 @@ codec       → events                      （只做 JSON 转换，不判断顺
 tools       → 无内部依赖                   （不认识 model / events / journal，不写事件）
 journal     → events / codec              （分配 seq、落盘；不判断事件是否合法）
 policy      → model
-llm         → policy / model              （不认识工具实现、日志、引擎）
+llm         → policy / model              （不认识工具实现、日志、引擎、HTTP）
+model_client→ 无（仅标准库）              （不认识 policy / model / 日志）
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
 reconcile   → journal / model / tools / events
@@ -374,7 +399,8 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 `model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`；
 `ledger_tools` 不得写事件、不得分配 `seq`、不得重试、不得判断预算；
 `codec` 不得判断事件合法性，也不得依赖 `journal`；`llm` 不得 import 任何模型 SDK、
-不得写日志、不得判断工具是否存在。
+不得写日志、不得判断工具是否存在；`model_client` 不得 import `agentrun` 内任何模块，
+否则「协议」与「实现」会互相纠缠。
 
 ## 5. 学习者已确认的决策
 
@@ -422,15 +448,17 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D40 | 只有决策、没有意图时的恢复 | 复用决策、补写意图并执行，不重新问策略 | 2026-10-25 | 工具一定没被调用过，重做安全；重新决策会换掉参数并留下两个决策。代价是引擎多一条「执行已有步骤」的路径 |
 | D41 | 失败原因的位置 | `RUN_FAILED.reason` 原文进入 `RunView.failure_reason` | 2026-10-25 | 只为让人一眼看到「为什么失败」；不解析、不分类，保持日志是唯一事实来源。代价是视图多一个字段 |
 | D42 | 提示截断策略 | 按字段截断（默认 200 字）并标注截掉多少，而不是整段提示一刀切 | 2026-10-25 | 整段截断会切掉工具清单与输出约定，模型反而更容易乱答；按字段截断保留结构，且确定性可测 |
+| D43 | HTTP 客户端边界 | 标准库、无重试、无流式、不解析动作、错误不含密钥与提示 | 2026-10-25 | 重试与解析属于外层；客户端只负责「这一次调用拿到了什么」。代价是超时/限流要由调用方兜底 |
+| D44 | 真实服务验证方式 | 只用本地 `http.server` 测协议，文档明写「未联真实服务」 | 2026-10-25 | 没有凭据就不假装验证过；把边界写清楚，比一个猜出来的兼容性结论有用 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 271 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 280 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（42 files） |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（14 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（44 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -439,17 +467,16 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 11 轮完成）
+- 时间：2026-10-25（第 12 轮完成）
 - 命令与结果：
-  - `pytest` → `271 passed`（新增 3 例：截断稳定性 2 例、`field_limit` 透传 1 例；
-    另有 1 条既有用例补断言 `failure_reason`）
+  - `pytest` → `280 passed`（新增 9 例：请求形状、四种坏响应、超时、策略拼接、
+    环境变量两组）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `42 files already formatted`
-  - `mypy` → `Success: no issues found in 14 source files`
-  - `python scripts/eval_suite.py` → `8/8 通过`；`review_demo.py` / `model_policy_demo.py`
-    等 7 个教学脚本退出码均为 0
-  - CLI `status` 在失败任务上多打印一行 `失败原因：未注册的工具：'nope'`
-- 未验证：CI 远端运行、真实模型服务、多进程并发、`kill -9` 与断电
+  - `ruff format --check .` → `44 files already formatted`
+  - `mypy` → `Success: no issues found in 15 source files`
+  - `python scripts/eval_suite.py` → `8/8 通过`
+  - 客户端测试全部走本地 `http.server`（127.0.0.1 随机端口），不访问外网
+- 未验证：真实模型服务（无凭据）、CI 远端运行、多进程并发、`kill -9` 与断电
 
 ### 第 4 轮新增证据
 
@@ -479,6 +506,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
 | 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
 | 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
+| 真实模型服务从未联调 | 兼容性、鉴权、限流、上下文长度都只按文档推断 | 拿到凭据时 |
+| 客户端没有重试与退避 | 一次 429 或超时就让本次决策失败，任务记 `RUN_FAILED` | 接真实服务时 |
 | 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
 | 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
 | CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
