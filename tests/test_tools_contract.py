@@ -150,6 +150,29 @@ def test_unexpected_exception_is_uncertain_not_failed() -> None:
     assert outcome.reason is not None
 
 
+def test_non_mapping_result_is_uncertain_not_success() -> None:
+    # 工具确实执行过，副作用可能已发生；返回值不可落盘，所以不能算成功
+    tool = CountingTool()
+    tool.value = ["not", "a", "mapping"]  # type: ignore[assignment]
+    outcome = run_tool(tool, {}, CTX)
+
+    assert outcome.status is ToolStatus.UNCERTAIN
+    assert outcome.status is not ToolStatus.SUCCEEDED
+    assert outcome.value is None
+    assert outcome.reason is not None
+    assert tool.run_calls == 1
+
+
+def test_none_result_is_uncertain() -> None:
+    tool = CountingTool()
+    tool.value = None  # type: ignore[assignment]
+    outcome = run_tool(tool, {}, CTX)
+
+    assert outcome.status is ToolStatus.UNCERTAIN
+    assert outcome.value is None
+    assert tool.run_calls == 1
+
+
 def test_outcome_is_a_plain_value_object() -> None:
     outcome = ToolOutcome(status=ToolStatus.UNCERTAIN, reason="未确认")
     assert outcome.value is None

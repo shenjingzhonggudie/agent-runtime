@@ -209,6 +209,9 @@ def run_tool(tool: Tool, args: Mapping[str, Any], ctx: ToolContext) -> ToolOutco
           时 ``kind == "invalid_args"``；校验自身崩了也归 FAILED，因为此时工具
           **一定没有执行过**——分类看的是“有没有调用过”，不是“异常看起来多吓人”。
         - ``run`` 返回映射 → SUCCEEDED。
+        - ``run`` 返回非映射（含 ``None``）→ UNCERTAIN。此时工具已经执行过，
+          副作用可能已发生；返回值不可落盘，所以既不能算成功，也不能算“确定
+          没生效”。类型注解在这里不起保护作用：Python 运行时不检查返回值。
         - ``run`` 抛 ``ToolRejected`` → FAILED，``kind == "rejected"``。
         - ``run`` 抛 ``ToolCrashed`` 或任何其他 ``Exception`` → UNCERTAIN，
           ``reason`` 说明原因。**不能**归为 FAILED：没收到明确拒绝，就无法证明
@@ -231,10 +234,16 @@ def run_tool(tool: Tool, args: Mapping[str, Any], ctx: ToolContext) -> ToolOutco
 
     try:
         result = tool.run(args, ctx)
-        return ToolOutcome(status=ToolStatus.SUCCEEDED, value=result)
     except ToolRejected as e:
         return ToolOutcome(status=ToolStatus.FAILED, error={"kind": "rejected", "message": str(e)})
     except ToolCrashed as e:
         return ToolOutcome(status=ToolStatus.UNCERTAIN, reason=str(e))
     except Exception as e:
         return ToolOutcome(status=ToolStatus.UNCERTAIN, reason=str(e))
+
+    if not isinstance(result, Mapping):
+        return ToolOutcome(
+            status=ToolStatus.UNCERTAIN,
+            reason=f"工具返回了 {type(result).__name__}，不是可落盘的映射",
+        )
+    return ToolOutcome(status=ToolStatus.SUCCEEDED, value=result)

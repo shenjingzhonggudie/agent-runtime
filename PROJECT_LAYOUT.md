@@ -1,14 +1,14 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-24（第 3 轮 3B 完成）
+> 最后更新：2026-10-25（第 4 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 3 轮 3B 完成：账本工具与演示脚本可运行，待学习者复盘 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示 |
+| 当前里程碑 | 第 4 轮完成：事件可无损编码为 JSON 文本并读回，落盘前置条件已具备 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示、事件编解码 |
 | 未实现能力 | 持久化日志、恢复、对账工具化、追踪、CLI、真实模型 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
@@ -30,6 +30,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
 │  ├─ events.py              事件契约：EventType / Event / make_step_key
 │  ├─ model.py               RunStatus / Outcome / InvalidEvent / StepView / RunView / apply / replay
+│  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
 │  ├─ journal.py             EventLog 协议 + MemoryEventLog（分配 seq）
 │  ├─ policy.py              ToolCall / Finish / Action / Policy 协议 / ScriptedPolicy
@@ -39,6 +40,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_package_smoke.py     包冒烟断言
    ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
    ├─ test_model_contract.py    事件折叠契约：顺序、seq、终态、结果唯一性
+   ├─ test_codec.py             事件编解码：往返无损、非 JSON 类型拒绝、坏文本拒绝
    ├─ test_tools_contract.py    工具执行：校验零副作用、异常分类、注册表
    ├─ test_journal_contract.py  内存日志：seq 按 run 独立分配
    ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
@@ -137,11 +139,32 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
    给出，若允许从其中取键，调用方就能绕过步骤级去重。
 3. `amount` 拒绝 `bool`：`True` 是 `int` 的子类，不单独判断就会被当成 1。
 
+### 3.6 事件编码（`codec.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `encode_event(event)` | `Event` | `str` | 产出 JSON 文本，字段固定为 `run_id / seq / type / payload / at`，`type` 用枚举字符串值 |
+| `decode_event(text)` | `str` | `Event` | 还原 `EventType` 与 `int`；任何读不懂的输入抛 `DecodeError` |
+| `EncodeError` | — | 异常 | 事件无法无损落盘 |
+| `DecodeError` | — | 异常 | 文本不是合法事件记录 |
+
+**不变量**：
+
+1. `decode_event(encode_event(e)) == e`，对任意可编码的事件成立。
+2. 只接受「编码后解码回来一模一样」的值。`tuple` 必须拒绝，不能交给 `json` 静默转成
+   `list`；映射的非 `str` 键同样拒绝；`nan` / `inf` / `-inf` 拒绝，因为 `nan != nan`
+   会让往返相等性直接失效。
+3. 解码时缺字段、类型不符、`type` 未知一律抛 `DecodeError`，绝不返回半成品事件。
+   `seq` 显式排除 `bool`——`True` 是 `int` 的子类。
+4. 本模块不判断事件顺序（`model.apply` 负责），不分配 `seq`（日志层负责），
+   不校验业务字段是否齐全（各事件的 payload 契约负责）。
+
 ## 4. 依赖方向
 
 ```text
 events      → 无
 model       → events                      （无 I/O、无数据库、无模型服务）
+codec       → events                      （只做 JSON 转换，不判断顺序、不分配 seq）
 tools       → 无内部依赖                   （不认识 model / events / journal，不写事件）
 journal     → events
 policy      → model
@@ -152,7 +175,8 @@ scripts     → engine / policy / journal / ledger_tools / demo
 ```
 
 `model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`；
-`ledger_tools` 不得写事件、不得分配 `seq`、不得重试、不得判断预算。
+`ledger_tools` 不得写事件、不得分配 `seq`、不得重试、不得判断预算；
+`codec` 不得判断事件合法性，也不得依赖 `journal`。
 
 ## 5. 学习者已确认的决策
 
@@ -176,15 +200,18 @@ scripts     → engine / policy / journal / ledger_tools / demo
 | D16 | 工具签名 | `validate(args, ctx)` / `run(args, ctx)`，由 engine 构造 `ToolContext` | 2026-10-24 | 工具拿得到 `step_key`；代价是所有工具与 Fake 工具都要改签名 |
 | D17 | 账本异常映射 | `LedgerRejected` / `LedgerCorrupted` 一律映射为 `ToolRejected` | 2026-10-24 | 账本的读盘先于写盘，失败时可证明零副作用；不映射成 `ToolCrashed` 是为了不把“确定没生效”说成“不知道” |
 | D18 | 续跑演示的位置 | 对账策略写在 `scripts/ledger_demo.py`，不进 `policy.py` | 2026-10-24 | 它只服务这一个验收场景；进库会把演示逻辑变成公共 API |
+| D19 | 编码载体 | `encode_event` 返回 `str`，不返回中间 `dict` | 2026-10-25 | 免掉“先编码成 dict、落盘时再 dumps”的第二层 |
+| D20 | 非 JSON 类型 | 一律 `EncodeError`，不用 `default=str` 兜底 | 2026-10-25 | `default=str` 会把 `Decimal("1.10")` 静默变成 `"1.10"`，重放时类型已变且无法发现 |
+| D21 | 编码模块位置 | 独立 `codec.py`，不并入 `events.py` | 2026-10-25 | `events.py` 保持零依赖纯契约；编解码需要 `json` 与递归校验 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 105 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 146 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（22 files） |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（9 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（24 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（10 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -193,15 +220,24 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-24（第 3 轮 3B 完成）
+- 时间：2026-10-25（第 4 轮完成）
 - 命令与结果：
-  - `pytest` → `105 passed`
+  - `pytest` → `146 passed`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `22 files already formatted`
-  - `mypy` → `Success: no issues found in 9 source files`
+  - `ruff format --check .` → `24 files already formatted`
+  - `mypy` → `Success: no issues found in 10 source files`
   - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
     第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
 - 未验证：CI 远端运行、真实模型、持久化、恢复、并发
+
+### 第 4 轮新增证据
+
+- `tests/test_codec.py` 39 个用例全绿，其中 6 个覆盖“编码后被拒绝”的类型：
+  `tuple` / `set` / `bytes` / `Decimal` / `datetime` / 自定义对象，另有嵌套 `list`
+  中的 `tuple` 与 `nan` / `inf` / `-inf`。
+- `run_tool` 新增运行时返回形状校验：`run` 返回非 `Mapping`（含 `None`）归为
+  `UNCERTAIN`，此时工具已执行，不能声称“确定没生效”。两条测试分别锁定
+  “工具被调用过一次”与“状态不是 SUCCEEDED”。
 
 ### 历史环境事件
 
@@ -217,7 +253,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `replay` 信任调用方给定顺序 | 乱序输入不会被发现 | 第 5 轮 Journal |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
-| `run` 返回非 Mapping 时未校验 | 成功结果可能不是可序列化对象 | 第 4 轮结果落盘前 |
+| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 5 轮写入前的最后校验 |
 | 对账逻辑只存在于演示脚本 | 引擎自己不会在 UNCERTAIN 后主动对账 | 第 6 轮对账 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
