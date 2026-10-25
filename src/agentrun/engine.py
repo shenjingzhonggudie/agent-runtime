@@ -7,14 +7,16 @@
     engine → {policy, tools, journal, model, events}
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from .events import EventType, make_step_key
 from .journal import EventLog
-from .model import RunStatus, RunView, replay
+from .model import Outcome, RunStatus, RunView, replay
 from .policy import Finish, Policy, PolicyError
-from .tools import ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
+from .tools import Tool, ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
 
 
 class StopReason(StrEnum):
@@ -119,17 +121,22 @@ class Engine:
             InvalidEvent: 日志内容非法（编程错误或存储损坏，不应在正常运行中出现）。
 
         Notes:
-            四种停止情形，都不追加任何事件：
+            五种情形，只有第 3 条会追加事件：
 
             1. 视图已是终态（成功 / 失败 / 预算耗尽 / 人工终止）→ 原样返回，
                ``stop_reason`` 由状态推出。
             2. 视图在等待人工复核 → 返回 ``WAITING_REVIEW``。复核结论只能由
                ``reconcile.resolve`` 写，引擎不能替人猜。
-            3. 最后一步已 ``STEP_STARTED`` 但没有结果 → 返回 ``UNCERTAIN``。外部世界
-               可能已经改变，既不能重做也不能跳过，必须先用对账补记结果。
-            4. 其余情况 → 交给 ``_drive`` 继续。
+            3. 最后一步只有 ``STEP_DECIDED``、没有 ``STEP_STARTED``（``attempts == 0``）
+               → **复用已落盘的决策**：补写意图并执行该工具，不调用策略。按协议此时
+               工具一定没被调用过，所以重新执行是安全的；重新决策反而会让日志里留下
+               两个决策，也可能换掉用户已经确认的参数。
+            4. 最后一步没有终局结论（没有结果事件，或结果是 ``UNCERTAIN``）→ 返回
+               ``UNCERTAIN``。外部世界可能已经改变，既不能重做也不能跳过，必须先对账
+               或复核。
+            5. 其余情况 → 交给 ``_drive`` 继续。
 
-            第 3 条是这一层最重要的判断：宁可停着不动，也不用“重试一次看看”去赌一个
+            第 4 条是这一层最重要的判断：宁可停着不动，也不用“重试一次看看”去赌一个
             非幂等调用没有生效。
         """
         events = self._log.read(run_id)
@@ -138,9 +145,82 @@ class Engine:
         view = replay(events)
         if view.status is not RunStatus.RUNNING:
             return EngineResult(view=view, stop_reason=StopReason(view.status.value))
-        if view.steps and view.steps[-1].outcome is None:
-            return EngineResult(view=view, stop_reason=StopReason.UNCERTAIN)
+        if view.steps:
+            last = view.steps[-1]
+            if last.outcome is None and last.attempts == 0:
+                try:
+                    tool = self._registry.get(last.tool)
+                except UnknownTool:
+                    self._log.append(
+                        run_id,
+                        EventType.RUN_FAILED,
+                        {"reason": f"未注册的工具：{last.tool!r}"},
+                    )
+                    return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
+                stop = self._execute(run_id, last.step, tool, last.args, attempt=1)
+                if stop is not None:
+                    return stop
+                return self._drive(run_id, view.max_steps)
+            if last.outcome is None or last.outcome is Outcome.UNCERTAIN:
+                return EngineResult(view=view, stop_reason=StopReason.UNCERTAIN)
         return self._drive(run_id, view.max_steps)
+
+    def _execute(
+        self,
+        run_id: str,
+        step: int,
+        tool: Tool,
+        args: Mapping[str, Any],
+        attempt: int,
+    ) -> EngineResult | None:
+        """执行一个已经决策的步骤：写意图、调用工具一次、写结果。
+
+        Args:
+            run_id: 任务标识。
+            step: 步骤号；该步必须已有 ``STEP_DECIDED``。
+            tool: 已解析的工具对象；不在这里查注册表，避免同一个判断做两次。
+            args: 决策时的参数；直接交给工具的 ``validate``。
+            attempt: 尝试次数，v0 恒为 1。
+
+        Returns:
+            EngineResult | None: 结果为 UNCERTAIN 时返回停止结果，其他情况返回
+            ``None``，由调用方决定继续还是结束。
+
+        Raises:
+            InvalidEvent: 追加的事件与日志状态冲突。
+
+        Notes:
+            ``STEP_STARTED`` 必须先写：它把「打算调用」和「已经交给外部世界」分成两个
+            可观察时刻。如果先执行后写意图，崩溃窗口就会变成「做了但日志不知道」，而
+            本项目的整个恢复语义都建立在这条顺序上。
+        """
+        self._log.append(run_id, EventType.STEP_STARTED, {"step": step, "attempt": attempt})
+        ctx = ToolContext(
+            run_id=run_id,
+            step=step,
+            attempt=attempt,
+            step_key=make_step_key(run_id, step),
+        )
+        outcome = run_tool(tool, args, ctx)
+
+        if outcome.status == ToolStatus.SUCCEEDED:
+            self._log.append(
+                run_id,
+                EventType.STEP_COMPLETED,
+                {"step": step, "result": dict(outcome.value or {})},
+            )
+            return None
+        if outcome.status == ToolStatus.FAILED:
+            self._log.append(
+                run_id,
+                EventType.STEP_FAILED,
+                {"step": step, "error": dict(outcome.error or {})},
+            )
+            return None
+        self._log.append(
+            run_id, EventType.STEP_UNCERTAIN, {"step": step, "reason": outcome.reason or ""}
+        )
+        return EngineResult(view=self._view(run_id), stop_reason=StopReason.UNCERTAIN)
 
     def _drive(self, run_id: str, max_steps: int) -> EngineResult:
         """主循环：按契约顺序追加事件、调用策略与工具、决定何时停止。
@@ -168,11 +248,11 @@ class Engine:
                RUN_FAILED，停止，原因 FAILED（配置错误，不是业务失败）。
             4. 追加 STEP_DECIDED（``step = len(view.steps) + 1``，
                ``step_key = make_step_key(run_id, step)``）。
-            5. 追加 STEP_STARTED（``attempt = 1``）。**顺序不能反**：先记决策，再记
-               意图，最后才允许碰外部世界。
-            6. 调 ``run_tool``，按结果追加 STEP_COMPLETED / STEP_FAILED /
-               STEP_UNCERTAIN。
-            7. 结果是 UNCERTAIN → 立即停止，原因 UNCERTAIN，视图保持 RUNNING，
+            5. 调 ``_execute``：先追加 STEP_STARTED（``attempt = 1``），再调
+               ``run_tool`` 一次，按结果追加 STEP_COMPLETED / STEP_FAILED /
+               STEP_UNCERTAIN。**顺序不能反**：先记决策，再记意图，最后才允许碰外部
+               世界。
+            6. 结果是 UNCERTAIN → 立即停止，原因 UNCERTAIN，视图保持 RUNNING，
                不再追加任何事件。其他结果回到第 1 步。
 
             工具结果的三种分类由 ``run_tool`` 判定，这里只按结果追加事件，不重新
@@ -211,30 +291,6 @@ class Engine:
                     "step_key": make_step_key(run_id, step),
                 },
             )
-            self._log.append(run_id, EventType.STEP_STARTED, {"step": step, "attempt": 1})
-
-            ctx = ToolContext(
-                run_id=run_id,
-                step=step,
-                attempt=1,
-                step_key=make_step_key(run_id, step),
-            )
-            outcome = run_tool(tool, action.args, ctx)
-
-            if outcome.status == ToolStatus.SUCCEEDED:
-                self._log.append(
-                    run_id,
-                    EventType.STEP_COMPLETED,
-                    {"step": step, "result": dict(outcome.value or {})},
-                )
-            elif outcome.status == ToolStatus.FAILED:
-                self._log.append(
-                    run_id,
-                    EventType.STEP_FAILED,
-                    {"step": step, "error": dict(outcome.error or {})},
-                )
-            else:
-                self._log.append(
-                    run_id, EventType.STEP_UNCERTAIN, {"step": step, "reason": outcome.reason or ""}
-                )
-                return EngineResult(view=self._view(run_id), stop_reason=StopReason.UNCERTAIN)
+            stop = self._execute(run_id, step, tool, action.args, attempt=1)
+            if stop is not None:
+                return stop

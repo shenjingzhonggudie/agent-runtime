@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第 9 轮完成：自动对账查不到时会停下来等人，人工复核的三种结论都有落地路径。
+第 10 轮完成：三个崩溃窗口都用真实子进程验证过，离线评测集 8/8 通过。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -18,6 +18,10 @@
 - 自动对账查不到记录时不再停在「不知道」，而是写 `REVIEW_REQUESTED` 进入 `WAITING_REVIEW`，等人工给结论。
 - 复核结论三种：`applied` 补记结果、`not_applied` 允许把调用当作新步骤重做、`abort` 终止任务（`ABORTED`）。
 - 等待复核期间引擎一步也不走：`resume` 只把状态带回来，不会替人猜。
+- 进程级故障矩阵：`after_decided`（决策已落盘）、`before_tool`（意图已落盘）、`after_tool`（副作用已发生）三个窗口都用 `os._exit` 真退进程，再用新进程恢复。
+- 只有决策、没有意图时复用已落盘的决策，不重新问策略——参数不会被换掉。
+- `STEP_UNCERTAIN` 不是终局：对账命中补记成功，查不到转人工，收敛之前 `resume` 一步不走。
+- 离线评测集覆盖 8 种结局，打印每次的停止原因、步数、事件数、余额与耗时。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 
@@ -102,7 +106,10 @@ result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", ma
 .\.venv\Scripts\ruff.exe check .
 .\.venv\Scripts\ruff.exe format --check .
 .\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe scripts\eval_suite.py
 ```
+
+`eval_suite.py` 是离线评测集：8 个场景各跑一遍，逐行核对停止原因、状态、步数、事件数与余额。余额同时充当「重复副作用」的探针。
 
 四者必须同时通过；CI 使用完全相同的入口。
 
@@ -111,7 +118,7 @@ result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", ma
 ```text
 src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器、日志、引擎、对账、CLI
 tests/               契约测试
-scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核
+scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核、进程级故障注入、评测集
 .github/workflows/   CI 配置
 PROJECT_LAYOUT.md    当前契约：目录、接口、决策、验证记录
 LEARNING_LOG.md      学习记录与复盘

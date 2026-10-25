@@ -125,3 +125,65 @@ def test_resume_uses_budget_recorded_in_log() -> None:
     assert result.stop_reason is StopReason.EXHAUSTED
     assert result.view.status is RunStatus.EXHAUSTED
     assert tool.calls == 0
+
+
+def test_resume_after_recorded_uncertain_waits_for_reconciliation() -> None:
+    # STEP_UNCERTAIN 不是终局结果，但在对账/复核收敛之前，续跑一步也不能走
+    log = MemoryEventLog()
+    log.append(RUN, EventType.RUN_STARTED, {"task": "t", "max_steps": 5})
+    seed_decided(log, 1)
+    seed_event(log, EventType.STEP_STARTED, {"step": 1, "attempt": 1})
+    seed_event(log, EventType.STEP_UNCERTAIN, {"step": 1, "reason": "响应丢失"})
+    before = log.read(RUN)
+
+    result = Engine(ScriptedPolicy([Finish("不该执行")]), ToolRegistry(), log).resume(RUN)
+
+    assert result.stop_reason is StopReason.UNCERTAIN
+    assert log.read(RUN) == before
+
+
+def test_resume_executes_decided_step_without_deciding_again() -> None:
+    # 决策已落盘、意图未落盘：复用决策，补写 STEP_STARTED 后执行；不重新问策略
+    log = MemoryEventLog()
+    tool = EchoTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    log.append(RUN, EventType.RUN_STARTED, {"task": "t", "max_steps": 2})
+    seed_decided(log, 1)
+
+    class RecordingPolicy:
+        def __init__(self) -> None:
+            self.seen: list[int] = []
+
+        def decide(self, view: Any) -> Finish:
+            self.seen.append(len(view.steps))
+            return Finish("完成")
+
+    policy = RecordingPolicy()
+    result = Engine(policy, registry, log).resume(RUN)
+
+    assert tool.calls == 1
+    assert policy.seen == [1]
+    assert result.stop_reason is StopReason.SUCCEEDED
+    assert [event.type for event in log.read(RUN)] == [
+        EventType.RUN_STARTED,
+        EventType.STEP_DECIDED,
+        EventType.STEP_STARTED,
+        EventType.STEP_COMPLETED,
+        EventType.RUN_SUCCEEDED,
+    ]
+
+
+def test_resume_decided_step_with_unknown_tool_fails_without_starting() -> None:
+    log = MemoryEventLog()
+    log.append(RUN, EventType.RUN_STARTED, {"task": "t", "max_steps": 2})
+    seed_decided(log, 1)
+
+    result = Engine(ScriptedPolicy([Finish("不该执行")]), ToolRegistry(), log).resume(RUN)
+
+    assert result.stop_reason is StopReason.FAILED
+    assert [event.type for event in log.read(RUN)] == [
+        EventType.RUN_STARTED,
+        EventType.STEP_DECIDED,
+        EventType.RUN_FAILED,
+    ]

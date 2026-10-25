@@ -20,7 +20,7 @@ from typing import Any
 
 from .events import Event, EventType
 from .journal import EventLog
-from .model import REVIEW_DECISIONS, RunStatus, RunView, replay
+from .model import REVIEW_DECISIONS, Outcome, RunStatus, RunView, replay
 from .tools import Tool, ToolContext, ToolStatus, run_tool
 
 
@@ -59,7 +59,7 @@ class ReconcileResult:
 
 
 def pending_step(view: RunView) -> int | None:
-    """找出第一个「已开始但没有结果」的步骤。
+    """找出第一个「已开始但结论未定」的步骤。
 
     Args:
         view: 从日志重放得到的视图。
@@ -68,11 +68,15 @@ def pending_step(view: RunView) -> int | None:
         int | None: 步骤号（从 1 开始）；没有这样的步骤时返回 ``None``。
 
     Notes:
+        「结论未定」包含两种：``outcome is None``（结果事件没来得及写）与
+        ``outcome is UNCERTAIN``（写了「不知道」，但还没收敛）。两者都要对账或复核，
+        区别只在日志里留下的证据，不在下一步该做什么。
+
         正常情况下最多只有一个：引擎串行执行，一次只会有一笔调用悬在半空。
-        同时出现多个说明日志被外部改过，此时补第一个仍然安全，其余留给下一次调用。
+        同时出现多个说明日志被外部改过，此时处理第一个仍然安全，其余留给下一次调用。
     """
     for step in view.steps:
-        if step.attempts > 0 and step.outcome is None:
+        if step.attempts > 0 and (step.outcome is None or step.outcome is Outcome.UNCERTAIN):
             return step.step
     return None
 

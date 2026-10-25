@@ -17,6 +17,8 @@ from agentrun.tools import ToolRegistry
 
 RUN = "run-1"
 AT = "2026-10-25T00:00:00Z"
+ALICE = "alice"
+BOB = "bob"
 
 
 def ev(seq: int, type_: EventType, **payload: Any) -> Event:
@@ -334,6 +336,71 @@ def test_not_applied_then_resume_retries_as_new_step(tmp_path: Path) -> None:
     assert ledger.balance("bob") == 250
     # 重做是新步骤，幂等键不同——否则账本会把第二次调用当成第一次的重试
     assert result.view.steps[0].step_key != result.view.steps[1].step_key
+
+
+def test_reconcile_can_complete_an_uncertain_step(tmp_path: Path) -> None:
+    # 工具抛了异常、引擎写下 STEP_UNCERTAIN：这不是终局结果，对账命中后应补记成功
+    log = seeded_log()
+    log.append(RUN, EventType.STEP_UNCERTAIN, {"step": 1, "reason": "响应丢失"})
+    ledger = Ledger(tmp_path / "ledger", initial={"alice": 1000, "bob": 0})
+    ledger.transfer(ALICE, BOB, 250, request_id=make_step_key(RUN, 1))
+
+    from agentrun.ledger_tools import LookupRequest
+
+    result = reconcile(log, RUN, LookupRequest(ledger))
+
+    view = view_of(log)
+    assert result.recorded is True
+    assert view.steps[0].outcome is Outcome.SUCCEEDED
+    assert ledger.balance(ALICE) == 750
+
+
+def test_completed_after_uncertain_is_allowed_only_once() -> None:
+    log = seeded_log()
+    log.append(RUN, EventType.STEP_UNCERTAIN, {"step": 1, "reason": "响应丢失"})
+    view = view_of(log)
+
+    converged = apply(
+        view,
+        ev(view.last_seq + 1, EventType.STEP_COMPLETED, step=1, result={"found": True}),
+    )
+    assert converged.steps[0].outcome is Outcome.SUCCEEDED
+
+    with pytest.raises(InvalidEvent):
+        apply(
+            converged,
+            ev(converged.last_seq + 1, EventType.STEP_COMPLETED, step=1, result={"found": True}),
+        )
+    with pytest.raises(InvalidEvent):
+        apply(
+            view,
+            ev(view.last_seq + 1, EventType.STEP_FAILED, step=1, error={"kind": "rejected"}),
+        )
+
+
+def test_review_request_accepts_an_uncertain_step() -> None:
+    log = seeded_log()
+    log.append(RUN, EventType.STEP_UNCERTAIN, {"step": 1, "reason": "响应丢失"})
+
+    request_review(log, "查不到，需要人工确认")
+
+    view = view_of(log)
+    assert view.status is RunStatus.WAITING_REVIEW
+    assert view.review is not None
+    assert view.review.reason == "查不到，需要人工确认"
+
+
+def test_resolve_uncertain_step_overrides_outcome() -> None:
+    log = seeded_log()
+    log.append(RUN, EventType.STEP_UNCERTAIN, {"step": 1, "reason": "响应丢失"})
+    request_review(log)
+
+    view = resolve(log, RUN, decision="not_applied", note="人工核对无记录")
+
+    assert view.status is RunStatus.RUNNING
+    assert view.steps[0].outcome is Outcome.FAILED
+    assert view.review is not None
+    assert view.review.decision == "not_applied"
 
 
 def test_review_request_only_accepts_a_pending_step_via_apply() -> None:

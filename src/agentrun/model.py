@@ -73,7 +73,8 @@ class StepView:
             日志，也不会影响重放结果。
         step_key: 跨重试稳定的调用键，见 ``events.make_step_key``。
         attempts: 已经开始的尝试次数；0 表示“已决策但尚未提交执行意图”。
-        outcome: 执行结果；None 表示还没有终局结果（未开始或进行中）。
+        outcome: 执行结果。None 表示还没有结论（未开始或进行中）；``UNCERTAIN`` 表示
+            执行过但此刻无法确认，**不是**终局结果——它还能被对账补记或人工复核收敛。
         result: 成功时的工具返回值；其他情况为 None。
         error: 失败时的错误信息；其他情况为 None。
         reason: 结果为 UNCERTAIN 时的说明（来自 STEP_UNCERTAIN 的 payload）；
@@ -181,9 +182,10 @@ def apply(view: RunView | None, event: Event) -> RunView:
             ``max_steps`` 为负；payload 缺少必需字段或类型不符；在终态之后追加
             事件；``step`` 与已有步骤不连续；``STEP_STARTED`` 的 ``attempt``
             不等于 ``attempts + 1``；结果事件之前没有对应的 ``STEP_STARTED``；
-            同一步骤出现第二个结果；``RUN_SUCCEEDED`` 的 answer 去空白后为空；
+            同一步骤出现第二个结果（``UNCERTAIN`` 之后补记 ``STEP_COMPLETED`` 除外）；
+            ``RUN_SUCCEEDED`` 的 answer 去空白后为空；
             等待复核时追加非 ``REVIEW_RESOLVED`` 的事件；
-            ``REVIEW_REQUESTED`` 指向的步骤不是「已开始、无结果」；
+            ``REVIEW_REQUESTED`` 指向的步骤不是「已开始、无结果或结果未知」；
             ``REVIEW_RESOLVED`` 的 step、decision、note、result 与契约不符。
 
     Notes:
@@ -252,7 +254,10 @@ def apply(view: RunView | None, event: Event) -> RunView:
             changes = {"outcome": Outcome.UNCERTAIN, "reason": _field(event, "reason", str)}
         if current.attempts == 0:
             raise InvalidEvent(f"步骤 {current.step} 尚未 STEP_STARTED，不能有结果")
-        if current.outcome is not None:
+        # 唯一的例外：对账把「不知道」收敛成「已生效」。UNCERTAIN 不是终局结果，
+        # 而是一条「此刻无法确认」的记录；补上证据之后允许再写一条 STEP_COMPLETED。
+        converged = current.outcome is Outcome.UNCERTAIN and event.type is EventType.STEP_COMPLETED
+        if current.outcome is not None and not converged:
             raise InvalidEvent(f"步骤 {current.step} 已有结果，不能出现第二个")
         return _with_step(view, event.seq, replace(current, **changes))
 
@@ -276,7 +281,11 @@ def apply(view: RunView | None, event: Event) -> RunView:
         if not reason.strip():
             raise InvalidEvent("REVIEW_REQUESTED 的 reason 去空白后为空")
         pending = next(
-            (item.step for item in view.steps if item.attempts > 0 and item.outcome is None),
+            (
+                item.step
+                for item in view.steps
+                if item.attempts > 0 and (item.outcome is None or item.outcome is Outcome.UNCERTAIN)
+            ),
             None,
         )
         if pending != step:
@@ -303,7 +312,8 @@ def apply(view: RunView | None, event: Event) -> RunView:
             raise InvalidEvent("REVIEW_RESOLVED 的 note 去空白后为空")
 
         current = _step_at(view, step)
-        if current.attempts == 0 or current.outcome is not None:
+        resolved_outcome = current.outcome is None or current.outcome is Outcome.UNCERTAIN
+        if current.attempts == 0 or not resolved_outcome:
             raise InvalidEvent(f"步骤 {step} 不需要复核结论")
         resolved = replace(review, decision=decision, note=note)
 

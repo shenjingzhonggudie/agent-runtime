@@ -7,8 +7,8 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 9 轮完成：自动对账查不到时进入人工复核，三种结论都可落地并续跑 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 六个子命令 |
+| 当前里程碑 | 第 10 轮完成：三个崩溃窗口由真实子进程验证，离线评测集 8/8 通过 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
 | 未实现能力 | 真实模型服务调用（需联网与密钥）；提示长度预算；多 worker 接管 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
@@ -28,7 +28,9 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
 │  ├─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
 │  ├─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
-│  └─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
+│  ├─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
+│  ├─ crash_runner.py        进程级故障注入：os._exit 在三个窗口退出（测试夹具）
+│  └─ eval_suite.py          离线评测集：8 种结局一张表
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -43,7 +45,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / NothingToResolve / pending_step / reconcile / resolve
 │  ├─ trace.py               TraceLine / summarize / timeline / export_jsonl（只读观察）
-│  └─ cli.py                 argparse 入口：run / resume / status / reconcile / trace
+│  └─ cli.py                 argparse 入口：run / resume / status / reconcile / resolve / trace
 └─ tests/
    ├─ test_package_smoke.py     包冒烟断言
    ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
@@ -59,6 +61,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
    ├─ test_reconcile.py         对账：查到才补记、查不到提交复核、补记后可续跑
    ├─ test_review.py            复核：暂停态、三种结论、重复复核、续跑闸门
+   ├─ test_process_crash.py     进程级：三个窗口真退进程后由新进程恢复
    ├─ test_trace.py             时间线：十一种事件可渲染、JSONL 可回读、不修改原事件
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
@@ -100,10 +103,12 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 2. 终态之后不得追加任何事件。
 3. 只有 `STEP_DECIDED` 会新增步骤；其余步骤事件更新已有步骤（`step` 必须已存在）。
 4. `STEP_STARTED` 的 `attempt` 必须等于 `attempts + 1`；有结果后不得再开始。
-5. 结果事件必须先有 `STEP_STARTED`（`attempts >= 1`），且该步还没有结果。
+5. 结果事件必须先有 `STEP_STARTED`（`attempts >= 1`），且该步还没有结果。唯一例外：
+   `STEP_UNCERTAIN` 之后允许一条 `STEP_COMPLETED`（对账把「不知道」收敛成「已生效」），
+   再往后仍然拒绝第二个结果。
 6. `RUN_SUCCEEDED` 的 `answer` 去空白后不得为空；`RUN_EXHAUSTED` 不得携带答案。
 7. 只有 `RUNNING` 能进入 `WAITING_REVIEW`，且 `REVIEW_REQUESTED` 的 `step` 必须是
-   「已开始、无结果」的那一步；进入后除 `REVIEW_RESOLVED` 外不接受任何事件。
+   「已开始、无结果或结果未知」的那一步；进入后除 `REVIEW_RESOLVED` 外不接受任何事件。
 8. `REVIEW_RESOLVED` 的 `step` 必须等于待复核步骤；`note` 去空白后不得为空；
    `applied` 必须带 `result`，`not_applied` / `abort` 不得带。`applied` /
    `not_applied` 回到 `RUNNING`，`abort` 进入终态 `ABORTED` 且不改变该步 `outcome`。
@@ -219,17 +224,20 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 | `Engine.resume(run_id)` | 已存在的任务 | `EngineResult` | 不写 `RUN_STARTED`，预算取 `view.max_steps` |
 | `NothingToResume` | — | 异常 | 日志里没有该任务的任何事件 |
 
-**续跑的四种分支**（都不追加事件）：
+**续跑的五种情形**（只有第 3 条会追加事件）：
 
 1. 视图已是终态（`SUCCEEDED` / `FAILED` / `EXHAUSTED` / `ABORTED`）→ 原样返回，
    `stop_reason` 由状态推出。
 2. 视图在 `WAITING_REVIEW` → 返回 `WAITING_REVIEW`。结论只能由 `resolve` 写入，
    引擎不替人猜。
-3. 最后一步 `STEP_STARTED` 但没有结果 → 返回 `UNCERTAIN`。外部世界可能已经改变，
-   既不能重做也不能跳过，必须先对账。
-4. 其余 → 继续主循环。
+3. 最后一步只有 `STEP_DECIDED`、没有 `STEP_STARTED` → **复用已落盘的决策**：补写
+   `STEP_STARTED` 并执行该工具，**不调用策略**。按协议此时工具一定没被调用过，重做
+   是安全的；重新决策会换掉已确认的参数，也会在日志里留下两个决策。
+4. 最后一步没有终局结论（没有结果事件，或 `outcome` 是 `UNCERTAIN`）→ 返回
+   `UNCERTAIN`。外部世界可能已经改变，既不能重做也不能跳过，必须先对账或复核。
+5. 其余 → 继续主循环。
 
-第 3 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
+第 4 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
 
 **决策失败**：`policy.decide` 抛 `PolicyError`（`ScriptExhausted` 也是它）→ 追加
 `RUN_FAILED`，停止，原因 `FAILED`。此时一条 `STEP_DECIDED` 都没有，因此可以断言零副作用；
@@ -239,7 +247,7 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `pending_step(view)` | 视图 | `int \| None` | 第一个「已开始、无结果」的步骤号 |
+| `pending_step(view)` | 视图 | `int \| None` | 第一个「已开始、结论未定（无结果或 `UNCERTAIN`）」的步骤号 |
 | `reconcile(log, run_id, lookup)` | 日志、任务、只读查询工具 | `ReconcileResult` | 查到补记；查不到提交复核；查询失败不写 |
 | `resolve(log, run_id, *, decision, note, result=None)` | 日志、任务、结论、依据、可选事实 | `RunView` | 写入 `REVIEW_RESOLVED`，返回复核后的视图 |
 | `NothingToReconcile` | — | 异常 | 当前不该自动对账：终态、已在复核、或没有待定步骤 |
@@ -405,14 +413,16 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D36 | `WAITING_REVIEW` 的性质 | 暂停态，不是终态 | 2026-10-25 | 等人给结论之后任务还要继续；设成终态就必须再开一个 run，日志会断成两截 |
 | D37 | 自动对账查不到时的动作 | 追加 `REVIEW_REQUESTED` 进入复核 | 2026-10-25 | 第 6 轮是「不写」，把不知道留在原地；现在自动手段用尽，把它升级成「需要人」才是闭环。代价是每次查不到都会产生一条待办 |
 | D38 | `not_applied` 之后的重做 | 新步骤、新 `step_key`，不复用原键 | 2026-10-25 | 复用键会让工具端把第二次业务当第一次的重试而吞掉；代价是日志里同一次业务意图出现两次 |
+| D39 | `STEP_UNCERTAIN` 的性质 | 可收敛状态：允许随后一条 `STEP_COMPLETED` | 2026-10-25 | 不确定不是事实，补上证据后必须能改写结论；若不开口子，显式记录的不确定步骤永远无法对账，只能伪装成「没写过」 |
+| D40 | 只有决策、没有意图时的恢复 | 复用决策、补写意图并执行，不重新问策略 | 2026-10-25 | 工具一定没被调用过，重做安全；重新决策会换掉参数并留下两个决策。代价是引擎多一条「执行已有步骤」的路径 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 258 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 268 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（39 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（42 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（14 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -422,20 +432,24 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 9 轮完成）
+- 时间：2026-10-25（第 10 轮完成）
 - 命令与结果：
-  - `pytest` → `258 passed`（新增 22 例：`test_review.py` 18 例、CLI 2 例、对账改写 1 例、
-    时间线扩到 11 种事件）
+  - `pytest` → `268 passed`（新增 10 例：进程级 3 例、决策复用 2 例、UNCERTAIN 收敛 5 例）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `39 files already formatted`
+  - `ruff format --check .` → `42 files already formatted`
   - `mypy` → `Success: no issues found in 14 source files`
-  - `python scripts/review_demo.py` → 退出码 0：场景 A 自动对账查不到 → `WAITING_REVIEW`
-    → `not_applied` → 续跑把转账作为第 2 步重做，9 条事件、`SUCCEEDED`、余额
-    `750/250`；场景 B 复核 `abort` → `ABORTED`，再次 `resume` 不追加事件、余额
-    `1000/0`
-  - CLI 端到端：seeded 崩溃现场 → `reconcile` 退出码 0（已提交复核）→ `resolve
-    --decision applied` 退出码 0 → `resume` 退出码 0、答案写入视图
-- 未验证：CI 远端运行、真实模型服务、多进程并发
+  - `python scripts/eval_suite.py` → 退出码 0，`8/8 通过`：正常完成 `750/250`、
+    工具拒绝 `1000/0`、预算耗尽 `750/250`、未注册工具 0 步、策略失败 0 步、
+    对账补记 `750/250`、复核重做 `750/250`、复核终止 `1000/0`
+  - `python scripts/crash_runner.py --crash after_tool` → 退出码 9（真退进程）；
+    `tests/test_process_crash.py` 三个窗口各一条用例：
+    - `before_tool`：账本 `1000/0` → `resume` 返回 `UNCERTAIN` 且不写事件 → 复核
+      `not_applied` → 重做一次 → `750/250`；
+    - `after_tool`：账本已 `750/250` → 对账补记 → `resume` 至 `SUCCEEDED`，
+      `STEP_STARTED` 只有 1 条，没有第二次转账；
+    - `after_decided`：`attempts == 0` → 直接执行已落盘决策，策略第一次被调用时
+      看到的步数是 1（不是 0），说明没有重新决策。
+- 未验证：CI 远端运行、真实模型服务、多进程并发、`kill -9` 与断电
 
 ### 第 4 轮新增证据
 
@@ -460,6 +474,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
+| 进程级故障只模拟 `os._exit` | 不等于 `kill -9`、断电或 fsync 丢失；存储层语义未验证 | 需要真机断电 / 容器 kill 时 |
+| 评测集绑在模拟账本上 | 8 个场景都基于 `demo.Ledger`，没有真实外部系统与网络抖动 | 接入真实外部服务时 |
 | 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
 | 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
 | 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
