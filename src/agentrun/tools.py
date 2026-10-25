@@ -205,9 +205,12 @@ def run_tool(tool: Tool, args: Mapping[str, Any], ctx: ToolContext) -> ToolOutco
 
         - ``args`` 不是映射 → FAILED，``error["kind"] == "invalid_args"``，
           **既不校验也不执行**。
-        - ``validate`` 抛任何 ``Exception`` → FAILED，**不得调用 run**。参数不合法
-          时 ``kind == "invalid_args"``；校验自身崩了也归 FAILED，因为此时工具
-          **一定没有执行过**——分类看的是“有没有调用过”，不是“异常看起来多吓人”。
+        - ``validate`` 抛 ``InvalidArgs`` → FAILED，``kind == "invalid_args"``，
+          **不得调用 run**。
+        - ``validate`` 抛其他任何 ``Exception`` → FAILED，``kind == "validator_crashed"``。
+          两种都归 FAILED，因为此时工具**一定没有执行过**——分类看的是「有没有调用过」，
+          不是「异常看起来多吓人」。``kind`` 分开是为了让日志能区分「用户输入错」与
+          「工具自身的 bug」，后者需要修代码，前者不需要。
         - ``run`` 返回映射 → SUCCEEDED。
         - ``run`` 返回非映射（含 ``None``）→ UNCERTAIN。此时工具已经执行过，
           副作用可能已发生；返回值不可落盘，所以既不能算成功，也不能算“确定
@@ -227,9 +230,13 @@ def run_tool(tool: Tool, args: Mapping[str, Any], ctx: ToolContext) -> ToolOutco
 
     try:
         tool.validate(args, ctx)
-    except Exception as e:
+    except InvalidArgs as e:
         return ToolOutcome(
             status=ToolStatus.FAILED, error={"kind": "invalid_args", "message": str(e)}
+        )
+    except Exception as e:
+        return ToolOutcome(
+            status=ToolStatus.FAILED, error={"kind": "validator_crashed", "message": str(e)}
         )
 
     try:

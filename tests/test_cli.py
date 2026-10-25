@@ -136,3 +136,43 @@ def test_bad_script_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
 
     assert code == 2
     assert "脚本错误" in capsys.readouterr().out
+
+
+def test_trace_prints_timeline(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    script = write_script(
+        tmp_path / "s.json",
+        [{"tool": "get_balance", "args": {"owner": "alice"}}, {"finish": "余额充足"}],
+    )
+    main(["run", "--run-id", "r1", "--script", str(script), *base_args(tmp_path)])
+    capsys.readouterr()
+
+    code = main(["trace", "--run-id", "r1", *db_only(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "RUN_STARTED" in out
+    assert "决定第 1 步" in out
+    assert "任务成功" in out
+
+
+def test_trace_export_writes_jsonl(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    script = write_script(
+        tmp_path / "s.json",
+        [{"tool": "get_balance", "args": {"owner": "alice"}}, {"finish": "余额充足"}],
+    )
+    main(["run", "--run-id", "r1", "--script", str(script), *base_args(tmp_path)])
+    capsys.readouterr()
+    target = tmp_path / "trace.jsonl"
+
+    code = main(["trace", "--run-id", "r1", "--export", str(target), *db_only(tmp_path)])
+
+    assert code == 0
+    assert len(target.read_text(encoding="utf-8").splitlines()) == 5
+    assert "已导出 5 条" in capsys.readouterr().out
+
+
+def test_trace_of_unknown_run_returns_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["trace", "--run-id", "missing", *db_only(tmp_path)])
+
+    assert code == 2
+    assert "没有这个任务" in capsys.readouterr().out

@@ -6,11 +6,12 @@
 
 ## 当前状态
 
-第 6 轮完成：六个模块（账本、事件折叠、工具、策略、引擎、日志）已串成可恢复执行链路。
+第 7 轮完成：账本、事件折叠、工具、策略、引擎、日志、对账、时间线已经串成完整链路。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
 - 遇到 `UNCERTAIN` 引擎立即停止；对账查到已生效则补记结果，查不到则保持未知，绝不自动重做非幂等调用。
+- `trace` 把事件渲染成时间线，也能导出 JSONL；观察者拿到的都是副本，改不动日志。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 
@@ -52,6 +53,10 @@ python -m venv .venv
 
 # 为「已开始、没有结果」的那一步补记结论
 .\.venv\Scripts\python.exe -m agentrun.cli reconcile --run-id r1
+
+# 打印时间线，或导出成一行一条的 JSONL
+.\.venv\Scripts\python.exe -m agentrun.cli trace --run-id r1
+.\.venv\Scripts\python.exe -m agentrun.cli trace --run-id r1 --export trace.jsonl
 ```
 
 默认 `--db agentrun.db`、`--ledger ledger`，账本与事件日志必须分开存储（D6）。

@@ -475,3 +475,69 @@
      账本无版本号、读改写无锁、CI 未远端运行、Docker 未触发。
 
 - **本轮状态**：实现与验证完成；**复盘待进行**。
+
+## 第 7 轮：时间线与观察者隔离
+
+- **本轮目标与架构位置**：把事件渲染成人能读的形状，并保证观察行为不会反向污染事实。
+  位置：`trace` 挂在 `events` / `codec` 之上，只读；`engine`、`journal` 一行未改。
+
+- **已确认的契约 / 决策，以及学习者的理由**：
+  - D28 深拷贝隔离 + `TraceLine` 不携带 payload 引用、D29 校验失败分
+    `invalid_args` / `validator_crashed` 两种 kind。学习者回复「继续」，实现由 Agent 完成。
+
+- **学习者的手工推演**：本轮未做。
+
+- **遇到的问题与最小复现**：
+  1. 第 1 轮起就挂着的债务「`StepView.args` 与 payload 共享同一 dict」在这一轮兑现。
+     修法是在 `apply` 里 `deepcopy(dict(args))`。第一想法是 `dict(args)` 浅拷贝，但
+     `args` 允许嵌套 dict/list，观察者改内层就能穿过隔离，测试
+     `test_step_args_nested_structures_are_isolated` 专门盯这一点。
+  2. `run_tool` 原来把 `validate` 抛的所有异常都标成 `kind="invalid_args"`，导致
+     「用户参数写错」和「校验函数自己有 bug」在日志里长得一样。改为按异常类型分
+     `invalid_args` / `validator_crashed`，两者仍都是 FAILED（工具未执行）。
+  3. `trace` 一开始想接受 `EventLog` 而不是 `Sequence[Event]`，但那会让观察者能顺手
+     调 `append`。改成只接事件序列，观察者拿不到写入口。
+  4. `export_jsonl` 里 `path.open(..., newline="\n")` 不能省：Windows 默认写 `\r\n`，
+     交给外部工具消费时会出现多余回车。
+
+- **最初假设 / Agent 是否误判**：
+  - 误判：以为「监听器」需要一个长驻的订阅机制。实际上本轮的收益全部来自「只读 +
+    副本」，实时通道留作债务。加了订阅反而要为退出、异常、背压引入新契约。
+  - 未误判：`timeline` 不排序。日志乱序本身是问题，替调用方排好会把问题藏了。
+
+- **验证命令、结果与证据**：
+  - `pytest` → `200 passed`
+  - `mypy` → `Success: no issues found in 13 source files`
+  - `ruff check .` → `All checks passed!`；`ruff format --check .` → `34 files already formatted`
+  - `python -m agentrun.cli trace --run-id demo` → 5 行时间线，形如
+    `2  STEP_DECIDED   决定第 1 步：get_balance {'owner': 'alice'}`
+  - `--export trace.jsonl` → 5 行，每行独立可被 `decode_event` 读回
+
+- **根因与可迁移规律**：
+  1. 「只读」不能靠自觉。只要把 `EventLog` 交给观察者，它就能 `append`；正确的做法是
+     在类型上就不给写入口。
+  2. 共享可变对象是延迟爆炸的漏洞。第 1 轮埋下，直到第 7 轮才因为「有人真的去改视图」
+     而暴露；如果一直没人改，它永远不会报错，但也就永远不安全。
+  3. 异常分类的粒度决定日志的诊断价值。`invalid_args` 与 `validator_crashed` 都归
+     FAILED，但前者改输入、后者改代码，合成一个 kind 就等于把两类工作混在一起。
+
+- **架构问题（学习者先答，Agent 不附答案）**：
+  1. `apply` 现在对每个 `STEP_DECIDED` 做 `deepcopy`。如果回放十万条事件，这个选择的
+     代价体现在哪里？有没有既隔离又不必每条都复制的做法？
+  2. `TraceLine` 里没有 `payload`。如果使用者需要看完整参数，应该从哪里取？这样做
+     和「直接把 payload 塞进 TraceLine」在安全性上差在哪？
+
+- **学习者原回答摘要**：本轮未答题。**复盘题累积 10 道**。
+
+- **纠偏与仍未理解的部分**：第 7 轮实现仍由 Agent 完成。至此七轮里学习者亲手写的
+  业务代码只有第 3 轮的部分工具与第 4 轮第一版 `codec`（未通过）。项目的「能跑」已经
+  成立，「学习者的能力」仍未被证明。
+
+- **债务**：
+  1. `trace` 只能一次性读取，没有边跑边看的实时通道 → 需要观察长任务时。
+  2. `reconcile` 只能补记成功 → 需要人工判定失败时。
+  3. 策略不持久化 → 第 8 轮模型策略。
+  4. `RUN_FAILED` 的 reason 未进视图 → 需要结构化失败原因时。
+  5. 前几轮遗留：`replay` 信任顺序、账本无版本号、读改写无锁、CI 未远端运行、Docker 未触发。
+
+- **本轮状态**：实现与验证完成；**复盘待进行**。

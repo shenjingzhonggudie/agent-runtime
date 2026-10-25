@@ -102,6 +102,9 @@ def test_validate_crash_is_failed_because_tool_never_ran() -> None:
     outcome = run_tool(tool, {}, CTX)
 
     assert outcome.status is ToolStatus.FAILED
+    assert outcome.error is not None
+    # 与「用户输入错」区分：这个 kind 说明要修代码，不是改参数
+    assert outcome.error["kind"] == "validator_crashed"
     assert tool.run_calls == 0
 
 

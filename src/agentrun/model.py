@@ -9,6 +9,7 @@
 """
 
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
@@ -51,7 +52,8 @@ class StepView:
     Attributes:
         step: 从 1 开始的步骤序号。
         tool: 被选中的工具名。
-        args: 决策时给出的参数，与事件中保存的内容一致。
+        args: 决策时给出的参数，已与事件 payload 深拷贝隔离；观察者修改它不会污染
+            日志，也不会影响重放结果。
         step_key: 跨重试稳定的调用键，见 ``events.make_step_key``。
         attempts: 已经开始的尝试次数；0 表示“已决策但尚未提交执行意图”。
         outcome: 执行结果；None 表示还没有终局结果（未开始或进行中）。
@@ -177,7 +179,8 @@ def apply(view: RunView | None, event: Event) -> RunView:
         step_key = _field(event, "step_key", str)
         if step != len(view.steps) + 1:
             raise InvalidEvent(f"step 必须是 {len(view.steps) + 1}，当前为 {step}")
-        new_step = StepView(step=step, tool=tool, args=args, step_key=step_key)
+        # 深拷贝：args 里允许嵌套 dict/list，浅拷贝挡不住观察者改内层
+        new_step = StepView(step=step, tool=tool, args=deepcopy(dict(args)), step_key=step_key)
         return replace(view, last_seq=event.seq, steps=view.steps + (new_step,))
 
     if event.type == EventType.STEP_STARTED:

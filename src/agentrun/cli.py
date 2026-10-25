@@ -1,11 +1,12 @@
 """命令行入口：把已有模块组装成可执行命令。
 
-四个子命令，各自只做一件事：
+五个子命令，各自只做一件事：
 
 - ``run``：从 JSON 脚本跑一个新任务。
 - ``resume``：在已有日志上继续跑。
 - ``status``：打印视图与每一步的当前状态。
 - ``reconcile``：为悬空的那一步补记结论。
+- ``trace``：打印时间线，或把事件导出成 JSONL。
 
 策略不持久化：``ScriptedPolicy`` 只依赖 ``len(view.steps)``，所以 ``resume`` 需要
 重新给一份同样的脚本。这是刻意的——策略属于调用方，不属于日志。
@@ -27,6 +28,7 @@ from .model import InvalidEvent, RunView, replay
 from .policy import Action, Finish, ScriptedPolicy, ToolCall
 from .reconcile import NothingToReconcile, pending_step, reconcile
 from .tools import ToolRegistry
+from .trace import export_jsonl, timeline
 
 DEFAULT_DB = Path("agentrun.db")
 DEFAULT_LEDGER = Path("ledger")
@@ -177,6 +179,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_trace(args: argparse.Namespace) -> int:
+    """执行 ``trace`` 子命令。"""
+    log = SqliteEventLog(args.db)
+    events = log.read(args.run_id)
+    if not events:
+        print(f"没有这个任务：{args.run_id}")
+        return 2
+    if args.export is not None:
+        count = export_jsonl(events, args.export)
+        print(f"已导出 {count} 条到 {args.export}")
+        return 0
+    for line in timeline(events):
+        print(f"{line.seq:>3}  {line.kind:<14} {line.summary}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器。"""
     parser = argparse.ArgumentParser(prog="agentrun", description="事件溯源执行引擎")
@@ -208,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     recon_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     recon_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     recon_p.set_defaults(func=cmd_reconcile)
+
+    trace_p = sub.add_parser("trace", help="打印时间线或导出 JSONL")
+    trace_p.add_argument("--run-id", required=True)
+    trace_p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    trace_p.add_argument("--export", type=Path, default=None)
+    trace_p.set_defaults(func=cmd_trace)
 
     return parser
 

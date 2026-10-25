@@ -239,3 +239,22 @@ def test_replay_matches_sequential_apply() -> None:
 def test_replay_empty_raises() -> None:
     with pytest.raises(InvalidEvent):
         replay([])
+
+
+def test_step_args_are_isolated_from_event_payload() -> None:
+    # 观察者改视图，不能污染日志里的事实
+    event = decided(2)
+    view = apply(apply(None, started()), event)
+
+    view.steps[0].args["owner"] = "bob"  # type: ignore[index]
+
+    assert event.payload["args"] == {"owner": "alice"}
+
+
+def test_step_args_nested_structures_are_isolated() -> None:
+    event = ev(2, EventType.STEP_DECIDED, step=1, tool="t", args={"a": {"b": 1}}, step_key="k")
+    view = apply(apply(None, started()), event)
+
+    view.steps[0].args["a"]["b"] = 99  # type: ignore[index]
+
+    assert event.payload["args"]["a"]["b"] == 1

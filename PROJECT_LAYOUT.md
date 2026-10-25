@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 6 轮完成）
+> 最后更新：2026-10-25（第 7 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 6 轮完成：可从日志续跑、可对账补记，并具备 CLI 入口 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、CLI 四个子命令 |
-| 未实现能力 | 事件追踪与时间线、真实模型策略 |
+| 当前里程碑 | 第 7 轮完成：事件可渲染成时间线并导出 JSONL，观察者与日志彻底隔离 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 五个子命令 |
+| 未实现能力 | 真实模型策略 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -39,7 +39,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / pending_step / reconcile
-│  └─ cli.py                 argparse 入口：run / resume / status / reconcile
+│  ├─ trace.py               TraceLine / summarize / timeline / export_jsonl（只读观察）
+│  └─ cli.py                 argparse 入口：run / resume / status / reconcile / trace
 └─ tests/
    ├─ test_package_smoke.py     包冒烟断言
    ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
@@ -53,10 +54,11 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_engine_resume.py     续跑：终态不重跑、未完成步骤先对账、预算取自日志
    ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
    ├─ test_reconcile.py         对账：查到才补记、查不到保持未知、补记后可续跑
-   └─ test_cli.py               CLI：脚本解析、子命令退出码、状态输出
+   ├─ test_trace.py             时间线：九种事件可渲染、JSONL 可回读、不修改原事件
+   └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
 
-**故意不存在**：`trace.py` / `llm.py`。
+**故意不存在**：`llm.py`。
 
 ## 3. 已确认的公共接口
 
@@ -242,6 +244,23 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 策略不持久化：`ScriptedPolicy` 只依赖 `len(view.steps)`，所以 `resume` 需要重新给一份
 同样的脚本。策略属于调用方，不属于日志。
 
+### 3.11 时间线（`trace.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `timeline(events)` | 事件可迭代对象 | `tuple[TraceLine, ...]` | 与输入等长、顺序不变 |
+| `summarize(event)` | 一条事件 | `str` | 一句话说明；字段缺失用空串占位，不抛异常 |
+| `export_jsonl(events, path)` | 事件、目标路径 | `int` | 一行一条，返回行数 |
+
+**不变量**：
+
+1. 只读：不写事件、不分配 `seq`、不改变任何状态。
+2. `timeline` 不排序、不校验顺序——乱序本身是应该被看见的问题。
+3. `TraceLine` 只含 `seq` / `at` / `kind` / `summary`，不携带 `payload` 引用，
+   观察者无从污染日志。
+4. JSONL 每行就是 `encode_event` 的输出，可被 `decode_event` 逐行读回；换行固定 `\n`。
+5. 观察者与日志的隔离在 `model.apply` 侧保证：`StepView.args` 是 `payload` 的深拷贝。
+
 ## 4. 依赖方向
 
 ```text
@@ -254,7 +273,8 @@ policy      → model
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
 reconcile   → journal / model / tools / events
-cli         → engine / journal / policy / tools / reconcile / ledger_tools / demo
+trace       → events / codec              （只读观察，不写日志、不判断合法性）
+cli         → engine / journal / policy / tools / reconcile / trace / ledger_tools / demo
 tests       → 全部
 scripts     → engine / policy / journal / ledger_tools / reconcile / demo
 ```
@@ -294,15 +314,17 @@ scripts     → engine / policy / journal / ledger_tools / reconcile / demo
 | D25 | 续跑预算 | 取日志里的 `view.max_steps`，不接收新参数 | 2026-10-25 | 预算属于任务；续跑时改预算等于事后改规则，日志里看不出来 |
 | D26 | 续跑已终结任务 | 返回现有视图 + 对应 `StopReason`，不抛异常、不追加事件 | 2026-10-25 | CLI 里“续跑一个早就成功的任务”是常见误操作，返回现状比栈信息有用 |
 | D27 | CLI 策略来源 | 读 JSON 脚本转成 `ScriptedPolicy`，用标准库 `argparse` | 2026-10-25 | 第 8 轮换模型策略时 CLI 不用动；不引 click，符合 D4 |
+| D28 | 观察者隔离方式 | `model.apply` 对 `args` 深拷贝，`TraceLine` 不携带 payload 引用 | 2026-10-25 | 浅拷贝挡不住嵌套改动；深拷贝的代价是每个 `STEP_DECIDED` 多一次复制 |
+| D29 | 校验失败的两种 kind | `invalid_args`（输入错）/ `validator_crashed`（工具自身 bug） | 2026-10-25 | 两者都归 FAILED（工具未执行），但只有后者需要改代码 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 183 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 200 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（31 files） |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（12 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（34 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（13 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -311,12 +333,12 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 6 轮完成）
+- 时间：2026-10-25（第 7 轮完成）
 - 命令与结果：
-  - `pytest` → `183 passed`
+  - `pytest` → `200 passed`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `31 files already formatted`
-  - `mypy` → `Success: no issues found in 12 source files`
+  - `ruff format --check .` → `34 files already formatted`
+  - `mypy` → `Success: no issues found in 13 source files`
   - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
     第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
   - `python scripts/recovery_demo.py` → 退出码 0；重开数据库后 5 条事件与重放视图
@@ -325,6 +347,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
     返回 `UNCERTAIN` 且余额不变 → 对账补记 step 1 → 再次 resume 跑完 8 条事件，
     余额最终停在 `750/250`，转账只生效一次
   - `python -m agentrun.cli run / status` → 退出码 0，事件 5 条，状态 `SUCCEEDED`
+  - `python -m agentrun.cli trace` → 5 行时间线，每行含序号、类型与一句话说明；
+    `--export trace.jsonl` 写出 5 行，每行可被 `decode_event` 读回
 - 未验证：CI 远端运行、真实模型、多进程并发
 
 ### 第 4 轮新增证据
@@ -345,9 +369,9 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 债务 | 影响 | 触发信号 |
 |---|---|---|
-| `StepView.args` 与事件 payload 共享同一 dict | 观察者修改会污染视图与日志 | 第 7 轮监听器隔离 |
-| `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 第 6 轮 CLI |
-| `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 第 6 轮接入外部事件源时 |
+| `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 需要结构化失败原因时 |
+| `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 接入外部事件源时 |
+| `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
@@ -362,5 +386,4 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
-| `trace.py` | 时间线、JSONL、只读监听 | 第 7 轮 |
-| `llm.py` | 模型适配器 | 第 8 轮 |
+| `llm.py` | 模型适配器：把模型输出转成 `Action` | 第 8 轮 |
