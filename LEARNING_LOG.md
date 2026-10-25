@@ -331,3 +331,74 @@
      账本无版本号、读改写无锁、CI 未远端运行、Docker 未触发。
 
 - **本轮状态**：实现与验证完成；**复盘待进行**（两道架构问题未答，连同第 3 轮两题）。
+
+## 第 5 轮：SQLite 事件日志
+
+- **本轮目标与架构位置**：把事件从内存搬到 SQLite，让「进程死了，视图还能重建」成为可验证的
+  事实。位置：`journal` 夹在 `engine` 与 `codec` 之间——`append` 负责分配 `seq` 并落盘，
+  `read` 负责按序读回并交给 `replay`；`engine` 一行未改，因为它只认 `EventLog` 协议。
+
+- **已确认的契约 / 决策，以及学习者的理由**：
+  - D22 两张表（`runs` 存计数器、`events` 存整条 body）、D23 `body` 存 `encode_event` 完整
+    输出、D24 每次操作新开连接。学习者回复「按你推荐的」。
+
+- **学习者的手工推演**：本轮未做。设计阶段由 Agent 直接给出表结构与事务边界。
+
+- **遇到的问题与最小复现**：
+  1. `sqlite3` 默认 `isolation_level=""` 会在任何写语句前插入隐式 `BEGIN`（DEFERRED），
+     之后再发 `BEGIN IMMEDIATE` 会报 `cannot start a transaction within a transaction`。
+     规避方式：连接时传 `isolation_level=None`，事务边界全部手写。这是本轮唯一必须提前
+     处理的坑，不是运行后才发现的。
+  2. 若 `BEGIN IMMEDIATE` 本身失败（例如 `database is locked`），此时事务并未开启，
+     直接 `ROLLBACK` 会二次抛错并盖掉原始异常。改为 `if conn.in_transaction:` 后再回滚。
+  3. `ruff format` 把多段 SQL 字符串拼接合并回单行，导致两次格式检查失败。最终按
+     formatter 的输出为准，而不是按手写的折行。
+  4. 演示脚本里一条 print 超过 100 列（`E501`），需拆成两段 f-string；`ruff format`
+     单独拆行后仍超长，说明 formatter 不解决行宽，只有 `check` 会报。
+
+- **最初假设 / Agent 是否误判**：
+  - 误判：以为 `append` 的「取 seq 与写入」必然需要 `RETURNING`。实际用
+    `SELECT last_seq` + `UPDATE` 两步即可，且在 `BEGIN IMMEDIATE` 下同样安全；
+    `RETURNING` 在 SQLite 3.35 才可用，多一个版本约束。
+  - 未误判：`body` 存整条事件、`seq` 另设一列，这个冗余设计在 `read` 时提供了
+    「列与内容不一致」的校验点，测试 `test_bad_body_raises_decode_error` 依赖它。
+
+- **验证命令、结果与证据**：
+  - `pytest tests/test_journal_sqlite.py` → 13 passed
+  - `pytest` → 159 passed
+  - `mypy` → `Success: no issues found in 10 source files`
+  - `ruff check .` → `All checks passed!`；`ruff format --check .` → `26 files already formatted`
+  - `python scripts/recovery_demo.py` → 退出码 0。5 条事件重开后与原序列相等、
+    重放视图与停止时相等；崩溃现场 3 条事件重放为 `RUNNING` / `attempts=1` / `outcome=None`。
+
+- **根因与可迁移规律**：
+  1. 「读计数器 + 写新值」这类两步操作，正确性完全取决于事务的**开始时机**，而不是
+     语句本身。DEFERRED 与 IMMEDIATE 的差别只在并发下暴露，单线程测试永远发现不了；
+     并发测试（4 线程 × 5 次）是唯一能证明它写对了的手段。
+  2. 失败路径的顺序同样属于契约：先 `encode` 再写计数器，才能保证编码失败不消耗 `seq`。
+     反过来写，异常被捕获后序号已经跳号，而跳号在恢复时会被读成「丢了一条事件」。
+  3. 冗余可以换来校验点。`seq` 同时存在列里和 body 里，看起来重复，但正是它让
+     「记录被改过」变成可检测的错误，而不是悄悄重放出一个错误视图。
+
+- **架构问题（学习者先答，Agent 不附答案）**：
+  1. 现在 `read` 把一个 run 的全部事件一次性载入内存再 `replay`。如果某个 run 有十万条
+     事件，第一个出问题的不是内存，而是别的东西——是什么？
+  2. `Engine.run` 每次都会追加 `RUN_STARTED`，所以已有日志无法直接续跑。要让引擎「接着
+     上次的视图继续」，改动最小的做法是什么？（提示：`model.apply` 的终态规则）
+
+- **学习者原回答摘要**：本轮未答题。**复盘题已累积 6 道**（第 3 轮 2 道、第 4 轮 2 道、
+  第 5 轮 2 道），均与第 6 轮对账/CLI 的设计直接相关。
+
+- **纠偏与仍未理解的部分**：本轮实现由 Agent 完成，学习者未参与落笔，因此「是否真正掌握
+  事务边界与并发」没有任何证据。下一轮若继续，建议由学习者独立重写 `append` 并在不看
+  答案的情况下通过并发测试。
+
+- **债务**：
+  1. `Engine.run` 每次都追加 `RUN_STARTED` → 无法在已有日志上续跑 → 第 6 轮 CLI。
+  2. 崩溃现场靠演示脚本手工 `append` 三条事件 → 引擎没有「走到一半停下」的正常入口 → 第 6 轮。
+  3. `replay` 仍不校验输入顺序（`SqliteEventLog` 用 `ORDER BY seq` 缓解）→ 第 6 轮接外部事件源。
+  4. `codec` 不校验 payload 的业务字段 → 第 6 轮写入前的最后校验。
+  5. 前几轮遗留：`args` 共享引用、`RUN_FAILED` 原因未进视图、账本无版本号、读改写无锁、
+     CI 未远端运行、Docker 未触发。
+
+- **本轮状态**：实现与验证完成；**复盘待进行**。

@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 4 轮完成）
+> 最后更新：2026-10-25（第 5 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 4 轮完成：事件可无损编码为 JSON 文本并读回，落盘前置条件已具备 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示、事件编解码 |
-| 未实现能力 | 持久化日志、恢复、对账工具化、追踪、CLI、真实模型 |
+| 当前里程碑 | 第 5 轮完成：事件落盘到 SQLite，重启后可读回并重放出同一视图 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、账本工具适配器、基于对账的续跑演示、事件编解码、崩溃现场重放 |
+| 未实现能力 | 主动恢复（从日志接着跑）、对账工具化、追踪、CLI、真实模型 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -24,7 +24,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ├─ .github/workflows/ci.yml  CI：安装 → lint → format → mypy → pytest
 ├─ scripts/
 │  ├─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
-│  └─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
+│  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
+│  └─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -32,7 +33,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ model.py               RunStatus / Outcome / InvalidEvent / StepView / RunView / apply / replay
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
-│  ├─ journal.py             EventLog 协议 + MemoryEventLog（分配 seq）
+│  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
 │  ├─ policy.py              ToolCall / Finish / Action / Policy 协议 / ScriptedPolicy
 │  ├─ engine.py              StopReason / EngineResult / Engine（循环、预算、终止）
 │  └─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
@@ -43,6 +44,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_codec.py             事件编解码：往返无损、非 JSON 类型拒绝、坏文本拒绝
    ├─ test_tools_contract.py    工具执行：校验零副作用、异常分类、注册表
    ├─ test_journal_contract.py  内存日志：seq 按 run 独立分配
+   ├─ test_journal_sqlite.py    SQLite 日志：seq 连续、重开读回、原子回滚、并发不重号
    ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
    ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止
    └─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
@@ -159,6 +161,35 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 4. 本模块不判断事件顺序（`model.apply` 负责），不分配 `seq`（日志层负责），
    不校验业务字段是否齐全（各事件的 payload 契约负责）。
 
+### 3.7 事件日志（`journal.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `EventLog` 协议 | — | — | `append(run_id, type_, payload)` 与 `read(run_id)` |
+| `MemoryEventLog` | — | 实例 | 内存实现，仅用于 v0 与测试 |
+| `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化；构造时不连接、不建表 |
+
+**表结构**：
+
+```sql
+runs   (run_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)
+events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+        PRIMARY KEY (run_id, seq))
+```
+
+`body` 存 `encode_event` 的完整输出，`codec` 是唯一格式来源。
+
+**不变量**：
+
+1. `seq` 按 `run_id` 独立计数，从 1 连续递增；跨实例、跨线程都不重号。
+2. `append` 原子：先 `BEGIN IMMEDIATE` 拿写锁，再「读 `last_seq` → 构造 `Event` →
+   `encode_event` → 写 `runs` → 写 `events` → `COMMIT`」。任一步失败整条回滚，
+   **不消耗 seq**——否则下一次正常写入会出现缺口，恢复时会被误判为丢事件。
+3. `read` 按 `seq` 升序返回；未知 `run_id` 返回空元组。`events.seq` 列与 `body`
+   内编码的 `seq` 不一致时抛 `DecodeError`，不以列为准继续。
+4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
+   DEFERRED，两个连接会读到同一个 `last_seq`。
+
 ## 4. 依赖方向
 
 ```text
@@ -166,7 +197,7 @@ events      → 无
 model       → events                      （无 I/O、无数据库、无模型服务）
 codec       → events                      （只做 JSON 转换，不判断顺序、不分配 seq）
 tools       → 无内部依赖                   （不认识 model / events / journal，不写事件）
-journal     → events
+journal     → events / codec              （分配 seq、落盘；不判断事件是否合法）
 policy      → model
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
@@ -203,14 +234,17 @@ scripts     → engine / policy / journal / ledger_tools / demo
 | D19 | 编码载体 | `encode_event` 返回 `str`，不返回中间 `dict` | 2026-10-25 | 免掉“先编码成 dict、落盘时再 dumps”的第二层 |
 | D20 | 非 JSON 类型 | 一律 `EncodeError`，不用 `default=str` 兜底 | 2026-10-25 | `default=str` 会把 `Decimal("1.10")` 静默变成 `"1.10"`，重放时类型已变且无法发现 |
 | D21 | 编码模块位置 | 独立 `codec.py`，不并入 `events.py` | 2026-10-25 | `events.py` 保持零依赖纯契约；编解码需要 `json` 与递归校验 |
+| D22 | 表结构 | `runs(run_id, last_seq)` + `events(run_id, seq, body)` 两张表 | 2026-10-25 | 计数器是独立事实；`SELECT last_seq` + `UPDATE` 比 `MAX(seq)+1` 子查询更好排查，也不依赖 `RETURNING`（SQLite 3.35+） |
+| D23 | `body` 内容 | 存整条 `encode_event` 输出，同时保留 `seq` 列做主键与排序 | 2026-10-25 | `codec` 保持唯一格式来源；多一列换来 seq 一致性校验点 |
+| D24 | 连接策略 | 每次 `append` / `read` 新开连接，不持有长连接 | 2026-10-25 | 无状态，“重启”等于换实例；代价是每次多一次连接开销 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 146 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 159 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（24 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（26 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（10 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -220,15 +254,17 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 4 轮完成）
+- 时间：2026-10-25（第 5 轮完成）
 - 命令与结果：
-  - `pytest` → `146 passed`
+  - `pytest` → `159 passed`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `24 files already formatted`
+  - `ruff format --check .` → `26 files already formatted`
   - `mypy` → `Success: no issues found in 10 source files`
   - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
     第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
-- 未验证：CI 远端运行、真实模型、持久化、恢复、并发
+  - `python scripts/recovery_demo.py` → 退出码 0；重开数据库后 5 条事件与重放视图
+    均与关闭前相等；崩溃现场 3 条事件重放为 `RUNNING`、`attempts=1`、`outcome=None`
+- 未验证：CI 远端运行、真实模型、主动恢复（从日志接着跑）、多进程并发
 
 ### 第 4 轮新增证据
 
@@ -250,10 +286,12 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 |---|---|---|
 | `StepView.args` 与事件 payload 共享同一 dict | 观察者修改会污染视图与日志 | 第 7 轮监听器隔离 |
 | `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 第 6 轮 CLI |
-| `replay` 信任调用方给定顺序 | 乱序输入不会被发现 | 第 5 轮 Journal |
+| `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 第 6 轮接入外部事件源时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
-| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 5 轮写入前的最后校验 |
+| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 6 轮写入前的最后校验 |
+| `Engine.run` 每次都追加 `RUN_STARTED` | 已有日志上无法接着跑；现在的“恢复”只能重放，不能续跑 | 第 6 轮 CLI |
+| 崩溃现场的收尾是手工的 | 演示脚本直接 `append` 三条事件模拟崩溃，引擎自身没有“走到一半停下”的入口 | 第 6 轮对账 |
 | 对账逻辑只存在于演示脚本 | 引擎自己不会在 UNCERTAIN 后主动对账 | 第 6 轮对账 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
@@ -264,7 +302,6 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
-| `journal.py` 的 SQLite 实现 | 原子追加、`seq` 分配、跨进程持久化 | 第 5 轮 |
 | `trace.py` | 时间线、JSONL、只读监听 | 第 7 轮 |
 | `llm.py` | 模型适配器 | 第 8 轮 |
 | `cli.py` | 入口与依赖组装 | 第 6 轮 |
