@@ -7,8 +7,8 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 13 轮完成：租约、epoch 与写入栅栏，跨进程接管由真实进程验证 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 当前里程碑 | 第 14 轮完成：日志完整性校验，读侧不再「读到多少算多少」 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
 | 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
@@ -39,7 +39,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ model.py               RunStatus / Outcome / ReviewView / InvalidEvent / StepView / RunView / apply / replay
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
-│  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / 两个实现（原子追加、租约栅栏）
+│  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / JournalCorrupted / 两个实现（原子追加、租约栅栏、读侧验真）
 │  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
 │  ├─ model_client.py        ModelClientError / HttpModelClient / _extract_content / client_from_env
@@ -66,6 +66,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_review.py            复核：暂停态、三种结论、重复复核、续跑闸门
    ├─ test_process_crash.py     进程级：三个窗口真退进程后由新进程恢复
    ├─ test_lease.py             租约：epoch、续租、过期、栅栏拒写、引擎失联
+   ├─ test_journal_integrity.py 完整性：缺号、缺尾、跨 run 混入、CLI 报告损坏
    ├─ test_process_takeover.py  接管：两个真实进程，旧 worker 醒来写入被拒
    ├─ test_trace.py             时间线：十一种事件可渲染、JSONL 可回读、不修改原事件
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
@@ -202,6 +203,7 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 | `Lease` | — | 冻结 dataclass | `run_id / owner / epoch / expires_at`；epoch 是接管代数 |
 | `LeaseLost` | — | 异常 | 写入被拒：被接管、非持有者，或从未持有。**这次写入没有发生** |
 | `LeaseBusy` | — | 异常 | 开始工作前就发现租约在别人手里 |
+| `JournalCorrupted` | — | 异常 | 序列不自洽：缺号、`last_seq` 与实际条数不符、事件归属别的 `run_id`、有事件无元数据 |
 | `MemoryEventLog` | — | 实例 | 内存实现，仅用于测试与单进程 |
 | `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化与租约；构造时不连接、不建表 |
 
@@ -224,6 +226,10 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
    **不消耗 seq**——否则下一次正常写入会出现缺口，恢复时会被误判为丢事件。
 3. `read` 按 `seq` 升序返回；未知 `run_id` 返回空元组。`events.seq` 列与 `body`
    内编码的 `seq` 不一致时抛 `DecodeError`，不以列为准继续。
+3a. **读侧验真**：`read` 另外核对三件事——事件是否从 1 连续、每条 `body` 的
+   `run_id` 是否等于查询的 `run_id`、`runs.last_seq` 是否等于实际条数。任一不符
+   抛 `JournalCorrupted`，不返回残缺序列。中间删除靠序号缺口发现，**末尾删除只能
+   靠 `last_seq` 对账**：少一条的序列本身完全连续。
 4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
    DEFERRED，两个连接会读到同一个 `last_seq`。
 5. **写栅栏**：`runs.owner` 非空时，`append` 必须携带 owner 与 epoch 都匹配的
@@ -472,14 +478,16 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D46 | epoch 何时加一 | 只在接管时加一；同 owner 重取、续租都不变 | 2026-10-25 | 每次重启都加一会让 worker 把自己的旧写入判成非法；只在接管时加，才能精确表达「换人了」 |
 | D47 | 失联的表示 | `StopReason.LOST`，不改任务状态 | 2026-10-25 | 失联是 worker 的结局，不是任务的结局；任务仍 `RUNNING`，等接管者推进 |
 | D48 | 租约默认值 | `owner=None` 关闭租约；启用时 `lease_ttl=30`，每次写前续租 | 2026-10-25 | 单进程演示不该被并发语义拖慢；默认 30 秒覆盖一次工具调用，短了会误判失联 |
+| D49 | 完整性校验放在哪一层 | 序列完整性归日志（`JournalCorrupted`），事件语义与归属归 `model`（`InvalidEvent`） | 2026-10-25 | 只有日志知道「应有多少条」（`last_seq`），只有模型知道「这条事件什么意思」；放进任一侧都会让另一侧撒谎。代价是同一份损坏可能表现为两种异常 |
+| D50 | 日志损坏的出口 | 不映射成 `StopReason`，一路抛到调用方；CLI 退出码 2 | 2026-10-25 | 损坏既不是任务的结局，也不是 worker 的结局（对比 `LOST`）；做成状态机就会让「读不出来」伪装成「跑到这里」。代价是 engine 的调用方必须自己接住 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 288 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 296 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（47 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（49 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -489,15 +497,15 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 13 轮完成）
+- 时间：2026-10-25（第 14 轮完成）
 - 命令与结果：
-  - `pytest` → `288 passed`（新增 8 例：租约/epoch/栅栏 7 例、跨进程接管 1 例）
+  - `pytest` → `296 passed`（新增 8 例：缺号、缺尾、跨 run、CLI 报告、手工编码回读）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `47 files already formatted`
+  - `ruff format --check .` → `49 files already formatted`
   - `mypy` → `Success: no issues found in 15 source files`
-  - `tests/test_process_takeover.py` → 进程 A 持租约、写三步后卡在工具里；租约过期，
-    进程 B 以 `EPOCH 2` 接管；A 醒来写结果被拒，退出码 7、输出 `LOST`；日志仍是
-    3 条事件；B 重新取租约（epoch 仍为 2）后可写
+  - `tests/test_journal_integrity.py` → 删中间一条报「序号不连续」；删末尾一条报
+    `last_seq` 不符；把别的 run 的 body 塞进来报归属错；`replay` 混入陌生 run 报
+    `InvalidEvent`；CLI `status` 在损坏库上退出码 2 并打印「事件日志不完整」
   - `python scripts/eval_suite.py` → `8/8 通过`
 - 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电
 
@@ -520,7 +528,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 债务 | 影响 | 触发信号 |
 |---|---|---|
 | `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 需要结构化失败原因时 |
-| `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 接入外部事件源时 |
+| 完整性校验没有密码学证据 | 事件与 `runs.last_seq` 被**一起**改小时，序列仍然自洽，查不出来；只能防误删，防不了篡改 | 需要对外举证「日志未被修改」时 |
+| `read` 每次做全量扫描 | 连续性检查与 `last_seq` 对账都要遍历全部事件；engine 每步 `_view` 都读一遍 | 单任务事件到万条、或需要高频查看时 |
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |

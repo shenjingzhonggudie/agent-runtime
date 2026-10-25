@@ -84,7 +84,9 @@ def test_old_schema_is_migrated(tmp_path: Path) -> None:
     path = tmp_path / "events.db"
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)")
-    conn.execute("INSERT INTO runs (run_id, last_seq) VALUES (?, 1)", (RUN,))
+    # last_seq 必须与实际事件条数一致，否则按新契约属于「日志不完整」：
+    # 这里没有事件，所以 last_seq 只能是 0。
+    conn.execute("INSERT INTO runs (run_id, last_seq) VALUES (?, 0)", (RUN,))
     conn.commit()
     conn.close()
 

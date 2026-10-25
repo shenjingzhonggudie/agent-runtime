@@ -3,6 +3,9 @@
 两个实现共用同一个 ``EventLog`` 协议：``MemoryEventLog`` 只用于测试与单进程场景，
 ``SqliteEventLog`` 负责跨进程持久化与租约。engine 不需要知道用的是哪一个。
 
+写入侧只保证三件事：序号连续、内容可解码、栅栏匹配。读取侧必须再验一次真——日志是
+恢复语义的唯一依据，缺一条事件就等于换了一个故事，不能"读到多少算多少"。
+
 依赖方向：
     engine → journal → events / codec
 """
@@ -52,12 +55,28 @@ class LeaseBusy(Exception):
     """
 
 
+class JournalCorrupted(Exception):
+    """日志自身不自洽，读不出可信的事件序列。
+
+    三种已知情形：``seq`` 有缺口（中间少了记录）、``runs.last_seq`` 与事件的最大
+    ``seq`` 不一致（末尾或整体被删过）、记录内容与所在 ``seq`` 不符（被改过）。
+
+    它与 ``InvalidEvent`` 必须分开：后者是"这条事件在当前位置不合法"，说明写入方
+    有问题；前者是"这条序列本身不完整"，说明存储被动过。两者的处置也不同——前者
+    该去修写入逻辑，后者该去查存储或从备份恢复，绝不能当作"任务只走到这里"。
+    """
+
+
 class EventLog(Protocol):
     """事件日志的最小接口：只能追加和读取，不能修改已写事件。
 
     Notes:
         ``append`` 的 ``lease`` 是可选栅栏：日志里有活跃租约时，不带租约或 epoch
         过期的写入一律 ``LeaseLost``；没有活跃租约时允许无栅栏写入（单 worker 模式）。
+
+        ``read`` 不只是"取出来"：它必须确认这条序列仍然自洽（缺号、元数据与记录
+        互相矛盾时抛 ``JournalCorrupted``）。返回一个"看起来能用"的残缺序列，比
+        直接报错危险得多——调用方会据此认为任务只走到这里。
     """
 
     def append(
@@ -145,8 +164,30 @@ class MemoryEventLog:
         return event
 
     def read(self, run_id: str) -> tuple[Event, ...]:
-        """返回该任务的全部事件，按写入顺序排列。"""
-        return tuple(event for event in self._events if event.run_id == run_id)
+        """按 ``seq`` 升序返回该任务的全部事件。
+
+        Args:
+            run_id: 任务标识。
+
+        Returns:
+            tuple[Event, ...]: 该任务的事件，按写入顺序排列；未知任务返回空元组。
+
+        Raises:
+            JournalCorrupted: ``seq`` 不构成从 1 开始的连续序列。内存实现没有外部
+                写入路径，正常情况下写不出这种序列；保留检查是为了让两个实现遵守
+                同一个读取契约——否则换实现会悄悄换掉错误暴露的方式。
+
+        Notes:
+            返回值是新元组，改动它不影响日志；但元素里的 ``payload`` 仍是同一份内层
+            容器，观察者不要就地修改。
+        """
+        events = tuple(event for event in self._events if event.run_id == run_id)
+        for index, event in enumerate(events, start=1):
+            if event.seq != index:
+                raise JournalCorrupted(
+                    f"{run_id!r} 的事件序号不连续：第 {index} 条记录的 seq 为 {event.seq}"
+                )
+        return events
 
     def acquire(self, run_id: str, owner: str, ttl: float) -> Lease | None:
         """取得或续用租约。
@@ -364,13 +405,20 @@ class SqliteEventLog:
         Raises:
             DecodeError: 库里的记录不是合法的事件文本。此时不能“读到多少算多少”：
                 残缺的事件序列会让 ``replay`` 得出一个看起来合法、实际错误的视图。
+            JournalCorrupted: 序列不自洽——``seq`` 有缺口、事件归属别的 ``run_id``、
+                ``runs.last_seq`` 与实际条数不符，或任务有事件却没有 ``runs`` 记录。
 
         Notes:
             解码统一走 ``decode_event``。``events.seq`` 列与 ``body`` 里编码的 ``seq``
             应当一致；不一致说明记录被改过，按解码失败处理，不要以列为准继续。
+
+            ``runs.last_seq`` 是"应有多少条"的独立证据：它在追加事务里与事件一起写入，
+            正常情况下必然等于事件条数。两者不符说明记录被删过——中间删除会先被序号
+            缺口抓到，末尾删除只有这条对账能抓。
         """
         conn = self._connect()
         try:
+            meta = conn.execute("SELECT last_seq FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             rows = conn.execute(
                 "SELECT seq, body FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
@@ -378,13 +426,29 @@ class SqliteEventLog:
             conn.close()
 
         events: list[Event] = []
-        for seq, body in rows:
+        for index, (seq, body) in enumerate(rows, start=1):
             event = decode_event(body)
             if event.seq != seq:
                 raise DecodeError(
                     f"记录 seq 与内容不一致：列为 {seq}，内容为 {event.seq}（run_id={run_id!r}）"
                 )
+            if event.run_id != run_id:
+                raise JournalCorrupted(
+                    f"事件 {seq} 属于 {event.run_id!r}，却出现在 {run_id!r} 的记录里"
+                )
+            if seq != index:
+                raise JournalCorrupted(f"{run_id!r} 的事件序号不连续：期望 {index}，实际 {seq}")
             events.append(event)
+
+        if meta is None:
+            if events:
+                raise JournalCorrupted(f"{run_id!r} 有事件却没有 runs 记录，无法判断序列完整性")
+            return ()
+        last_seq = int(meta[0])
+        if last_seq != len(events):
+            raise JournalCorrupted(
+                f"{run_id!r} 的 last_seq 为 {last_seq}，实际只读到 {len(events)} 条事件"
+            )
         return tuple(events)
 
     def acquire(self, run_id: str, owner: str, ttl: float) -> Lease | None:

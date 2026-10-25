@@ -182,6 +182,7 @@ def apply(view: RunView | None, event: Event) -> RunView:
     Raises:
         InvalidEvent: 出现下列任一情况时抛出，且不得返回部分更新：
             首条事件不是 RUN_STARTED；``seq`` 不等于上一条 +1（首条必须为 1）；
+            事件的 ``run_id`` 与视图不一致（两个任务的事件被拼在一起）；
             ``max_steps`` 为负；payload 缺少必需字段或类型不符；在终态之后追加
             事件；``step`` 与已有步骤不连续；``STEP_STARTED`` 的 ``attempt``
             不等于 ``attempts + 1``；结果事件之前没有对应的 ``STEP_STARTED``；
@@ -217,6 +218,8 @@ def apply(view: RunView | None, event: Event) -> RunView:
             steps=(),
             answer=None,
         )
+    if event.run_id != view.run_id:
+        raise InvalidEvent(f"事件属于 {event.run_id!r}，不能折叠进 {view.run_id!r} 的视图")
     if view.status is not RunStatus.RUNNING and view.status is not RunStatus.WAITING_REVIEW:
         raise InvalidEvent(f"任务已处于终态 {view.status}，不能再追加事件：{event.type}")
     if event.seq != view.last_seq + 1:
@@ -360,13 +363,19 @@ def replay(events: Iterable[Event]) -> RunView:
     """按顺序折叠一串事件，重建视图。
 
     Args:
-        events: 事件序列，调用方保证按 ``seq`` 升序提供。
+        events: 事件序列，调用方保证按 ``seq`` 升序提供，且全部属于同一个
+            ``run_id``。
 
     Returns:
         RunView: 折叠结果，等价于依次调用 ``apply``。
 
     Raises:
-        InvalidEvent: 事件序列为空或其中任一事件不合法。
+        InvalidEvent: 事件序列为空、其中任一事件不合法，或混入了别的 ``run_id``。
+
+    Notes:
+        ``replay`` 只按顺序折叠，不自己去核对"这条序列是否完整"：缺号会被
+        ``apply`` 的 ``seq + 1`` 规则抓到，但**末尾缺一条**它看不出来——那需要
+        ``runs.last_seq`` 这类外部证据，属于日志层的 ``JournalCorrupted``。
     """
     view: RunView | None = None
     for event in events:

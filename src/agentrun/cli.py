@@ -26,7 +26,7 @@ from typing import Any
 
 from .demo import Ledger
 from .engine import Engine, NothingToResume, StopReason
-from .journal import LeaseBusy, SqliteEventLog
+from .journal import JournalCorrupted, LeaseBusy, SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
 from .model import REVIEW_DECISIONS, InvalidEvent, RunView, replay
 from .policy import Action, Finish, ScriptedPolicy, ToolCall
@@ -334,6 +334,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     func = args.func
     try:
         return int(func(args))
+    except JournalCorrupted as exc:
+        print(f"事件日志不完整：{exc}")
+        return 2
     except InvalidEvent as exc:
         print(f"日志内容非法：{exc}")
         return 2
