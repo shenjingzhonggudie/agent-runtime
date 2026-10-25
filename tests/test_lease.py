@@ -17,6 +17,15 @@ from agentrun.tools import SideEffect, ToolContext, ToolRegistry
 
 RUN = "r1"
 
+# 接管用例的租约时长与工具体内的等待。
+#
+# 不能把 TTL 压到「够触发过期」就完事：本机一次「续租 + 追加」实测 p50 约 30ms、
+# p99 约 70ms、最坏 100ms（见 ``scripts/_diag_lease_timing.py``）。TTL 若与这个量级
+# 同阶（曾用 0.05），worker 会在工具真正跑起来之前就把自己判死，用例随机失败。
+# 所以 TTL 取 0.5s，等待取 1.0s：留给接管 500ms 余量，约为最坏事务耗时的 5 倍。
+TTL = 0.5
+HOLD = 1.0
+
 
 def test_same_owner_keeps_epoch_and_other_owner_is_blocked() -> None:
     log = MemoryEventLog()
@@ -111,7 +120,7 @@ class TakeoverEcho:
 
     def run(self, args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, Any]:
         """等租约过期，由 w2 接管，再返回。"""
-        time.sleep(0.06)
+        time.sleep(HOLD)
         self.new_lease = self._log.acquire(RUN, "w2", 30)
         return {"ok": True}
 
@@ -126,7 +135,7 @@ def test_takeover_mid_call_stops_the_old_worker(tmp_path: Path) -> None:
         registry,
         log,
         owner="w1",
-        lease_ttl=0.05,
+        lease_ttl=TTL,
     )
 
     result = old.run(RUN, "t", 3)

@@ -71,14 +71,16 @@ def takeover(db: Path, owner: str) -> subprocess.CompletedProcess[str]:
 def test_takeover_process_blocks_stale_writes(tmp_path: Path) -> None:
     db = tmp_path / "events.db"
     log = SqliteEventLog(db)
-    old = start_hold(db, "A", ttl=0.5, hold=1.5)
+    old = start_hold(db, "A", ttl=0.8, hold=3.0)
 
-    deadline = time.time() + 5
+    deadline = time.time() + 15
     while len(log.read(RUN)) < 3 and time.time() < deadline:
         time.sleep(0.02)
     assert len(log.read(RUN)) == 3
 
-    time.sleep(0.6)  # 等 A 的租约过期；它仍睡在工具里
+    # 等 A 的租约过期（它仍睡在工具里）。余量按最坏事务耗时放大：
+    # 本机一次「续租 + 追加」最坏约 100ms，这里留 800ms。
+    time.sleep(1.6)
     new = takeover(db, "B")
     assert new.returncode == 0, new.stderr
     assert "EPOCH 2" in new.stdout
