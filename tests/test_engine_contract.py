@@ -199,6 +199,7 @@ def test_unknown_tool_fails_the_run() -> None:
     assert result.view.status is RunStatus.FAILED
     assert result.stop_reason is StopReason.FAILED
     assert result.view.steps == ()
+    assert result.view.failure_reason == "未注册的工具：'nope'"
 
 
 # --- 决策失败 ------------------------------------------------------------

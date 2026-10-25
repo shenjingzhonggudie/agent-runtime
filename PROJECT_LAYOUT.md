@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 9 轮完成）
+> 最后更新：2026-10-25（第 11 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 10 轮完成：三个崩溃窗口由真实子进程验证，离线评测集 8/8 通过 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
-| 未实现能力 | 真实模型服务调用（需联网与密钥）；提示长度预算；多 worker 接管 |
+| 当前里程碑 | 第 11 轮完成：失败原因进入视图，提示长度有确定性上限，v1 硬化收尾 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 未实现能力 | 真实模型服务调用（需联网与密钥）；多 worker 接管 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -91,7 +91,7 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 |---|---|---|---|
 | `apply(view, event)` | 当前视图或 `None`、事件 | 新 `RunView` | 纯函数，不修改入参；非法抛 `InvalidEvent` |
 | `replay(events)` | 事件可迭代对象 | `RunView` | 等价于依次 `apply`；空序列抛 `InvalidEvent` |
-| `RunView` | — | 冻结 dataclass | `run_id, task, max_steps, status, last_seq, steps, answer, review` |
+| `RunView` | — | 冻结 dataclass | `run_id, task, max_steps, status, last_seq, steps, answer, review, failure_reason` |
 | `StepView` | — | 冻结 dataclass | `step, tool, args, step_key, attempts, outcome, result, error, reason` |
 | `ReviewView` | — | 冻结 dataclass | `step, reason, decision, note`；`decision is None` 表示仍在等待 |
 | `RunStatus` | — | 6 值枚举 | `RUNNING / WAITING_REVIEW / SUCCEEDED / FAILED / EXHAUSTED / ABORTED`；后四者不可逆，`WAITING_REVIEW` 是暂停态 |
@@ -107,6 +107,8 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
    `STEP_UNCERTAIN` 之后允许一条 `STEP_COMPLETED`（对账把「不知道」收敛成「已生效」），
    再往后仍然拒绝第二个结果。
 6. `RUN_SUCCEEDED` 的 `answer` 去空白后不得为空；`RUN_EXHAUSTED` 不得携带答案。
+   `RUN_FAILED` 的 `reason` 原文进入 `failure_reason`，供 CLI 直接打印；不要求非空
+   ——策略的异常文本可能本身就是空串。
 7. 只有 `RUNNING` 能进入 `WAITING_REVIEW`，且 `REVIEW_REQUESTED` 的 `step` 必须是
    「已开始、无结果或结果未知」的那一步；进入后除 `REVIEW_RESOLVED` 外不接受任何事件。
 8. `REVIEW_RESOLVED` 的 `step` 必须等于待复核步骤；`note` 去空白后不得为空；
@@ -320,9 +322,9 @@ CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume
 |---|---|---|---|
 | `ToolSpec` | `name`、`description` | 冻结 dataclass | 只用于提示；名字必须与注册表一致，拼错由引擎判为未知工具 |
 | `ModelClient` 协议 | — | — | 唯一方法 `complete(prompt) -> str`；不解析、不碰日志 |
-| `build_prompt(view, tools)` | 视图、工具清单 | `str` | 纯函数；工具按名字排序，渲染不抛异常 |
+| `build_prompt(view, tools, *, field_limit=200)` | 视图、工具清单、字段上限 | `str` | 纯函数；工具按名字排序，渲染不抛异常；超长字段确定性截断 |
 | `parse_action(text)` | 模型原始输出 | `Action` | 严格解析；任何不合约定抛 `PolicyError` |
-| `ModelPolicy(client, tools)` | 客户端、工具清单 | 策略实例 | `decide` = 渲染 → 调用 → 解析；无缓存、无游标 |
+| `ModelPolicy(client, tools, *, field_limit=200)` | 客户端、工具清单、字段上限 | 策略实例 | `decide` = 渲染 → 调用 → 解析；无缓存、无游标 |
 | `PolicyError` | — | 异常 | 决策失败；引擎写 `RUN_FAILED`，不是 `UNCERTAIN` |
 
 **提示结构**（固定三段，无第四段）：任务与预算、已执行步骤（`序号. 工具(参数) → 结果`）、
@@ -346,6 +348,9 @@ CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume
 2. `ModelPolicy` 不保存提示、输出或步数；连续两次用同一视图 `decide`，两次提示相同。
 3. 客户端抛任何 `Exception` → `PolicyError`；一个工具都没调用，外部世界未变。
 4. 不可 JSON 化的 `args` 在提示里用 `repr` 兜底：提示不是日志，不承担可落盘承诺。
+5. 超长字段按 `field_limit` 截断，并写明「截断 N 字」；`<= 0` 表示不截断。截断是
+   确定性的——同一输入必得同一字符串，否则续跑时的提示会随长度漂移。
+6. 截断只发生在渲染层：日志、视图、工具参数都是原文，不做任何裁剪。
 
 ## 4. 依赖方向
 
@@ -415,12 +420,14 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D38 | `not_applied` 之后的重做 | 新步骤、新 `step_key`，不复用原键 | 2026-10-25 | 复用键会让工具端把第二次业务当第一次的重试而吞掉；代价是日志里同一次业务意图出现两次 |
 | D39 | `STEP_UNCERTAIN` 的性质 | 可收敛状态：允许随后一条 `STEP_COMPLETED` | 2026-10-25 | 不确定不是事实，补上证据后必须能改写结论；若不开口子，显式记录的不确定步骤永远无法对账，只能伪装成「没写过」 |
 | D40 | 只有决策、没有意图时的恢复 | 复用决策、补写意图并执行，不重新问策略 | 2026-10-25 | 工具一定没被调用过，重做安全；重新决策会换掉参数并留下两个决策。代价是引擎多一条「执行已有步骤」的路径 |
+| D41 | 失败原因的位置 | `RUN_FAILED.reason` 原文进入 `RunView.failure_reason` | 2026-10-25 | 只为让人一眼看到「为什么失败」；不解析、不分类，保持日志是唯一事实来源。代价是视图多一个字段 |
+| D42 | 提示截断策略 | 按字段截断（默认 200 字）并标注截掉多少，而不是整段提示一刀切 | 2026-10-25 | 整段截断会切掉工具清单与输出约定，模型反而更容易乱答；按字段截断保留结构，且确定性可测 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 268 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 271 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
 | ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（42 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（14 source files，0 error） |
@@ -432,23 +439,16 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 10 轮完成）
+- 时间：2026-10-25（第 11 轮完成）
 - 命令与结果：
-  - `pytest` → `268 passed`（新增 10 例：进程级 3 例、决策复用 2 例、UNCERTAIN 收敛 5 例）
+  - `pytest` → `271 passed`（新增 3 例：截断稳定性 2 例、`field_limit` 透传 1 例；
+    另有 1 条既有用例补断言 `failure_reason`）
   - `ruff check .` → `All checks passed!`
   - `ruff format --check .` → `42 files already formatted`
   - `mypy` → `Success: no issues found in 14 source files`
-  - `python scripts/eval_suite.py` → 退出码 0，`8/8 通过`：正常完成 `750/250`、
-    工具拒绝 `1000/0`、预算耗尽 `750/250`、未注册工具 0 步、策略失败 0 步、
-    对账补记 `750/250`、复核重做 `750/250`、复核终止 `1000/0`
-  - `python scripts/crash_runner.py --crash after_tool` → 退出码 9（真退进程）；
-    `tests/test_process_crash.py` 三个窗口各一条用例：
-    - `before_tool`：账本 `1000/0` → `resume` 返回 `UNCERTAIN` 且不写事件 → 复核
-      `not_applied` → 重做一次 → `750/250`；
-    - `after_tool`：账本已 `750/250` → 对账补记 → `resume` 至 `SUCCEEDED`，
-      `STEP_STARTED` 只有 1 条，没有第二次转账；
-    - `after_decided`：`attempts == 0` → 直接执行已落盘决策，策略第一次被调用时
-      看到的步数是 1（不是 0），说明没有重新决策。
+  - `python scripts/eval_suite.py` → `8/8 通过`；`review_demo.py` / `model_policy_demo.py`
+    等 7 个教学脚本退出码均为 0
+  - CLI `status` 在失败任务上多打印一行 `失败原因：未注册的工具：'nope'`
 - 未验证：CI 远端运行、真实模型服务、多进程并发、`kill -9` 与断电
 
 ### 第 4 轮新增证据
@@ -480,7 +480,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
 | 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
 | 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
-| 提示没有长度预算 | 长 `result` 会把提示撑大，可能超出上下文 | 结果变长或接真实服务时 |
+| 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
 | CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |

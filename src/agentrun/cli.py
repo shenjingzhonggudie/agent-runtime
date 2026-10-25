@@ -112,6 +112,8 @@ def print_view(view: RunView) -> None:
     print(f"步数：{len(view.steps)}/{view.max_steps}")
     if view.answer is not None:
         print(f"答案：{view.answer}")
+    if view.failure_reason is not None:
+        print(f"失败原因：{view.failure_reason}")
     for step in view.steps:
         outcome = step.outcome.value if step.outcome is not None else "-"
         print(f"  {step.step:>2}  {step.tool:<14} attempts={step.attempts} outcome={outcome}")

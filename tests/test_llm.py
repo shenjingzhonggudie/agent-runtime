@@ -130,6 +130,30 @@ def test_prompt_without_tools_says_so() -> None:
     assert "（没有可用工具，只能结束任务。）" in build_prompt(view(), [])
 
 
+def test_prompt_clips_long_fields_with_a_stable_marker() -> None:
+    long = "x" * 500
+    current = view(step(1, attempts=1, outcome=Outcome.SUCCEEDED, result={"text": long}))
+
+    prompt = build_prompt(current, TOOLS, field_limit=40)
+
+    assert "（截断 " in prompt
+    assert prompt == build_prompt(current, TOOLS, field_limit=40)
+    assert len(prompt) < 800
+
+
+def test_prompt_does_not_clip_when_fields_fit() -> None:
+    assert "截断" not in build_prompt(view(), TOOLS, field_limit=10_000)
+
+
+def test_model_policy_passes_field_limit_through() -> None:
+    client = OneShotModel('{"finish": "完成"}')
+    current = view(step(1, attempts=1, outcome=Outcome.SUCCEEDED, result={"text": "y" * 200}))
+
+    ModelPolicy(client, TOOLS, field_limit=5).decide(current)
+
+    assert "（截断 " in client.prompts[0]
+
+
 # --- 输出解析 ------------------------------------------------------------
 
 

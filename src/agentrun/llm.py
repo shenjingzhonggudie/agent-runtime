@@ -59,7 +59,19 @@ class ModelClient(Protocol):
         ...
 
 
-def _json(value: Any) -> str:
+def _clip(text: str, limit: int) -> str:
+    """把过长的渲染结果截断，并标明截掉了多少字。
+
+    Notes:
+        截断必须确定：同样的输入永远得到同样的字符串，否则同一视图会渲染出不同提示，
+        续跑就失去意义。``limit <= 0`` 表示不截断。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return f"{text[:limit]}…（截断 {len(text) - limit} 字）"
+
+
+def _json(value: Any, limit: int) -> str:
     """把任意值渲染成单行 JSON，供提示展示使用。
 
     Notes:
@@ -67,27 +79,28 @@ def _json(value: Any) -> str:
         宁可显示 ``<object at 0x...>`` 也不让渲染失败。真正要求可无损落盘的是事件，
         不是提示——两者的严格程度不同，不能互相替代。
     """
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=repr)
+    return _clip(json.dumps(value, ensure_ascii=False, sort_keys=True, default=repr), limit)
 
 
-def _render_step(step: StepView) -> str:
+def _render_step(step: StepView, limit: int) -> str:
     """渲染历史中的一步：``序号. 工具(参数) → 结果``。"""
-    head = f"{step.step}. {step.tool}({_json(step.args)})"
+    head = f"{step.step}. {step.tool}({_json(step.args, limit)})"
     if step.outcome is Outcome.SUCCEEDED:
-        return f"{head} → SUCCEEDED {_json(step.result or {})}"
+        return f"{head} → SUCCEEDED {_json(step.result or {}, limit)}"
     if step.outcome is Outcome.FAILED:
-        return f"{head} → FAILED {_json(step.error or {})}"
+        return f"{head} → FAILED {_json(step.error or {}, limit)}"
     if step.outcome is Outcome.UNCERTAIN:
-        return f"{head} → UNCERTAIN {step.reason or ''}"
+        return f"{head} → UNCERTAIN {_clip(step.reason or '', limit)}"
     return f"{head} → {'已开始，没有结果' if step.attempts else '已决策，尚未开始'}"
 
 
-def build_prompt(view: RunView, tools: Sequence[ToolSpec]) -> str:
+def build_prompt(view: RunView, tools: Sequence[ToolSpec], *, field_limit: int = 200) -> str:
     """把视图渲染成提示。
 
     Args:
         view: 当前视图；只读取，不修改。
         tools: 可用工具清单。按名字排序后渲染，调用方给的顺序不影响结果。
+        field_limit: 单个参数或结果的渲染上限（字符数）；``<= 0`` 表示不截断。
 
     Returns:
         str: 纯文本提示。同样的视图与同一组工具必然得到同一份字符串。
@@ -109,7 +122,7 @@ def build_prompt(view: RunView, tools: Sequence[ToolSpec]) -> str:
         "已执行的步骤：",
     ]
     if view.steps:
-        lines.extend(_render_step(step) for step in view.steps)
+        lines.extend(_render_step(step, field_limit) for step in view.steps)
     else:
         lines.append("（还没有执行任何步骤。）")
 
@@ -214,6 +227,7 @@ class ModelPolicy:
         client: 模型客户端，只要求 ``complete(prompt) -> str``。
         tools: 可用工具清单，渲染进提示。必须与引擎注册表保持一致，否则模型会对着
             不存在的工具做决策。
+        field_limit: 单个参数或结果的渲染上限（字符数），默认 200；``<= 0`` 不截断。
 
     Notes:
         不缓存、不记游标：每次 ``decide`` 都重新渲染提示。这保证「同一个视图 → 同一份
@@ -221,9 +235,16 @@ class ModelPolicy:
         引擎无法保证——温度为 0 是使用前提，不是本模块能验证的事实。
     """
 
-    def __init__(self, client: ModelClient, tools: Sequence[ToolSpec]) -> None:
+    def __init__(
+        self,
+        client: ModelClient,
+        tools: Sequence[ToolSpec],
+        *,
+        field_limit: int = 200,
+    ) -> None:
         self._client = client
         self._tools = tuple(tools)
+        self._field_limit = field_limit
 
     def decide(self, view: RunView) -> Action:
         """渲染提示、调用模型、解析成动作。
@@ -243,7 +264,7 @@ class ModelPolicy:
             没拿到决策」，一律归为 ``PolicyError``，不写 ``UNCERTAIN``。后者意味着
             「可能已经改了」，与这里恰好相反。
         """
-        prompt = build_prompt(view, self._tools)
+        prompt = build_prompt(view, self._tools, field_limit=self._field_limit)
         try:
             text = self._client.complete(prompt)
         except Exception as exc:

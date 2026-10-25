@@ -126,6 +126,8 @@ class RunView:
         answer: 成功时的最终答案；其他情况为 None。
         review: 最近一次人工复核记录；从未请求过复核时为 None。``decision`` 为
             None 表示仍在等待，此时 ``status`` 必为 ``WAITING_REVIEW``。
+        failure_reason: ``RUN_FAILED`` 携带的原因；其他路径为 None。保留原文，方便
+            CLI 与日志直接回答「为什么失败」，不必再去翻事件。
     """
 
     run_id: str
@@ -136,6 +138,7 @@ class RunView:
     steps: tuple[StepView, ...] = ()
     answer: str | None = None
     review: ReviewView | None = None
+    failure_reason: str | None = None
 
 
 def _field(event: Event, name: str, kind: type | tuple[type, ...]) -> Any:
@@ -268,8 +271,14 @@ def apply(view: RunView | None, event: Event) -> RunView:
         return replace(view, last_seq=event.seq, status=RunStatus.SUCCEEDED, answer=answer)
 
     if event.type == EventType.RUN_FAILED:
-        _field(event, "reason", str)
-        return replace(view, last_seq=event.seq, status=RunStatus.FAILED, answer=None)
+        reason = _field(event, "reason", str)
+        return replace(
+            view,
+            last_seq=event.seq,
+            status=RunStatus.FAILED,
+            answer=None,
+            failure_reason=reason,
+        )
 
     if event.type == EventType.RUN_EXHAUSTED:
         _field(event, "max_steps", int)
