@@ -32,7 +32,10 @@ from typing import IO, Any, cast
 if sys.platform == "win32":  # pragma: no cover - 平台分支，本机只跑 Windows 这一侧
     import msvcrt
 else:  # pragma: no cover - 本机未验证
-    import fcntl  # type: ignore[import-not-found]
+    # 不要在这里加 `type: ignore`：mypy 会裁剪 `sys.platform` 分支，Windows 上这行
+    # 根本不会被分析；到了 Linux 上它变成活代码，忽略标记会被 warn_unused_ignores
+    # 判成多余，CI 直接红（第 17 轮实测）。
+    import fcntl
 
 _STATE_FILE = "ledger.json"
 _LOCK_FILE = "ledger.lock"
