@@ -6,12 +6,15 @@
 
 ## 当前状态
 
-第 7 轮完成：账本、事件折叠、工具、策略、引擎、日志、对账、时间线已经串成完整链路。
+第 8 轮完成：决策可以来自模型，且「策略给不出动作」有了确定的失败语义。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
 - 遇到 `UNCERTAIN` 引擎立即停止；对账查到已生效则补记结果，查不到则保持未知，绝不自动重做非幂等调用。
 - `trace` 把事件渲染成时间线，也能导出 JSONL；观察者拿到的都是副本，改不动日志。
+- 模型策略把视图渲染成提示、把模型输出严格解析成 `ToolCall` / `Finish`；不联网，客户端由调用方注入。
+- 解析失败、模型超时、脚本写短一律 `PolicyError` → `RUN_FAILED`：一个工具都没调用，外部世界未变。
+- 提示只由视图与工具清单决定，重启后同一个视图得到同一份提示，续跑不再依赖重新提供脚本。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 
@@ -65,6 +68,26 @@ python -m venv .venv
 
 安装为命令后可直接用 `agentrun <子命令>`。
 
+脚本是策略的一种：写短了不会抛栈，下一次决策会记 `RUN_FAILED`，退出码 1。
+
+## 模型策略（离线）
+
+`llm.py` 只定义适配器，不绑定任何模型服务：客户端只需实现 `complete(prompt) -> str`。
+
+```python
+from agentrun.engine import Engine
+from agentrun.llm import ModelPolicy, ToolSpec
+
+policy = ModelPolicy(client, [ToolSpec("get_balance", "读取账户余额")])
+result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", max_steps=5)
+```
+
+完整演示（假模型，不需要网络与密钥）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\model_policy_demo.py
+```
+
 ## 本地检查
 
 ```powershell
@@ -79,9 +102,9 @@ python -m venv .venv
 ## 目录
 
 ```text
-src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、日志、引擎、对账、CLI
+src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器、日志、引擎、对账、CLI
 tests/               契约测试
-scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑
+scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略
 .github/workflows/   CI 配置
 PROJECT_LAYOUT.md    当前契约：目录、接口、决策、验证记录
 LEARNING_LOG.md      学习记录与复盘

@@ -12,7 +12,7 @@ from agentrun.engine import Engine, EngineResult, StopReason
 from agentrun.events import EventType
 from agentrun.journal import MemoryEventLog
 from agentrun.model import Outcome, RunStatus, replay
-from agentrun.policy import Action, Finish, ToolCall
+from agentrun.policy import Action, Finish, PolicyError, ScriptedPolicy, ToolCall
 from agentrun.tools import SideEffect, ToolContext, ToolRegistry, ToolRejected
 
 
@@ -199,3 +199,46 @@ def test_unknown_tool_fails_the_run() -> None:
     assert result.view.status is RunStatus.FAILED
     assert result.stop_reason is StopReason.FAILED
     assert result.view.steps == ()
+
+
+# --- 决策失败 ------------------------------------------------------------
+
+
+class FailingPolicy:
+    """模拟策略给不出动作：模型输错了，或脚本用完了。"""
+
+    def decide(self, view: Any) -> Action:
+        raise PolicyError("模型输出不是合法 JSON")
+
+
+def test_policy_error_fails_the_run_without_calling_tools() -> None:
+    tool = FakeTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    log = MemoryEventLog()
+    engine = Engine(FailingPolicy(), registry, log)
+
+    result = engine.run("run-1", "测试任务", 5)
+
+    assert [event.type for event in log.read("run-1")] == [
+        EventType.RUN_STARTED,
+        EventType.RUN_FAILED,
+    ]
+    assert log.read("run-1")[1].payload["reason"] == "模型输出不是合法 JSON"
+    assert result.view.status is RunStatus.FAILED
+    assert result.stop_reason is StopReason.FAILED
+    assert result.view.steps == ()
+    assert tool.calls == 0
+
+
+def test_exhausted_script_fails_the_run_instead_of_crashing() -> None:
+    log = MemoryEventLog()
+    engine = Engine(ScriptedPolicy([]), ToolRegistry(), log)
+
+    result = engine.run("run-1", "测试任务", 5)
+
+    assert [event.type for event in log.read("run-1")] == [
+        EventType.RUN_STARTED,
+        EventType.RUN_FAILED,
+    ]
+    assert result.stop_reason is StopReason.FAILED

@@ -1,15 +1,15 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 7 轮完成）
+> 最后更新：2026-10-25（第 8 轮完成）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 7 轮完成：事件可渲染成时间线并导出 JSONL，观察者与日志彻底隔离 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 五个子命令 |
-| 未实现能力 | 真实模型策略 |
+| 当前里程碑 | 第 8 轮完成：模型输出可解析成动作，决策失败与「可能已生效」彻底分开 |
+| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析）、内存与 SQLite 两种事件日志、引擎主循环与预算、引擎续跑、对账补记、账本工具适配器、事件编解码、时间线与 JSONL 导出、CLI 五个子命令 |
+| 未实现能力 | 真实模型服务调用（需联网与密钥）；提示长度预算 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -26,7 +26,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
 │  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
 │  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
-│  └─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
+│  ├─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
+│  └─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -35,7 +36,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
 │  ├─ journal.py             EventLog 协议 / MemoryEventLog / SqliteEventLog（原子追加、跨进程持久化）
-│  ├─ policy.py              ToolCall / Finish / Action / Policy 协议 / ScriptedPolicy
+│  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
+│  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
 │  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / pending_step / reconcile
@@ -50,7 +52,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_journal_contract.py  内存日志：seq 按 run 独立分配
    ├─ test_journal_sqlite.py    SQLite 日志：seq 连续、重开读回、原子回滚、并发不重号
    ├─ test_policy_contract.py   脚本策略：按 len(steps) 取动作、脚本耗尽
-   ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止
+   ├─ test_llm.py               模型策略：提示只由视图决定、输出严格解析、客户端失败
+   ├─ test_engine_contract.py   引擎：事件顺序、预算边界、UNCERTAIN 立即停止、决策失败
    ├─ test_engine_resume.py     续跑：终态不重跑、未完成步骤先对账、预算取自日志
    ├─ test_ledger_tools.py      账本工具：参数校验、异常映射、幂等键取自 ctx
    ├─ test_reconcile.py         对账：查到才补记、查不到保持未知、补记后可续跑
@@ -58,7 +61,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
 
-**故意不存在**：`llm.py`。
+**故意不存在**：真实模型客户端（HTTP、密钥、超时重试）。`llm.py` 只定义协议与解析，
+不 import 任何模型 SDK，因此全仓库仍然零运行时依赖。
 
 ## 3. 已确认的公共接口
 
@@ -215,6 +219,10 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 第 2 条是这层的核心：宁可停着不动，也不拿「重试一次看看」去赌一个非幂等调用没生效。
 
+**决策失败**：`policy.decide` 抛 `PolicyError`（`ScriptExhausted` 也是它）→ 追加
+`RUN_FAILED`，停止，原因 `FAILED`。此时一条 `STEP_DECIDED` 都没有，因此可以断言零副作用；
+不能记成 `UNCERTAIN`——那个状态只留给「可能已经改了」。
+
 ### 3.9 对账（`reconcile.py`）
 
 | 接口 | 输入 | 输出 | 说明 |
@@ -241,8 +249,9 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 公共参数 `--db`（默认 `agentrun.db`）与 `--ledger`（默认 `ledger`）。
 
-策略不持久化：`ScriptedPolicy` 只依赖 `len(view.steps)`，所以 `resume` 需要重新给一份
-同样的脚本。策略属于调用方，不属于日志。
+CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume` 需要重新给一份
+同样的脚本。策略属于调用方，不属于日志。脚本写短时下一次决策抛 `PolicyError`，任务记
+`RUN_FAILED`（退出码 1），不再把异常栈抛给用户。
 
 ### 3.11 时间线（`trace.py`）
 
@@ -261,6 +270,39 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 4. JSONL 每行就是 `encode_event` 的输出，可被 `decode_event` 逐行读回；换行固定 `\n`。
 5. 观察者与日志的隔离在 `model.apply` 侧保证：`StepView.args` 是 `payload` 的深拷贝。
 
+### 3.12 模型策略（`llm.py`）
+
+| 接口 | 输入 | 输出 | 说明 |
+|---|---|---|---|
+| `ToolSpec` | `name`、`description` | 冻结 dataclass | 只用于提示；名字必须与注册表一致，拼错由引擎判为未知工具 |
+| `ModelClient` 协议 | — | — | 唯一方法 `complete(prompt) -> str`；不解析、不碰日志 |
+| `build_prompt(view, tools)` | 视图、工具清单 | `str` | 纯函数；工具按名字排序，渲染不抛异常 |
+| `parse_action(text)` | 模型原始输出 | `Action` | 严格解析；任何不合约定抛 `PolicyError` |
+| `ModelPolicy(client, tools)` | 客户端、工具清单 | 策略实例 | `decide` = 渲染 → 调用 → 解析；无缓存、无游标 |
+| `PolicyError` | — | 异常 | 决策失败；引擎写 `RUN_FAILED`，不是 `UNCERTAIN` |
+
+**提示结构**（固定三段，无第四段）：任务与预算、已执行步骤（`序号. 工具(参数) → 结果`）、
+可用工具与输出约定。时间、进程号、随机数不得进入提示，否则同一视图渲染出不同文本。
+
+**解析规则**（全部为硬性拒绝）：
+
+| 情况 | 结果 |
+|---|---|
+| 非 `str`、空白、非 JSON、JSON 非对象 | `PolicyError` |
+| `tool` 与 `finish` 同时出现或都不出现 | `PolicyError` |
+| 调用工具时出现 `args` 之外的字段；结束任务时出现 `args` | `PolicyError` |
+| `tool` 不是非空字符串、`args` 不是对象 | `PolicyError` |
+| `finish` 不是非空字符串（含 `250` 这种数字） | `PolicyError` |
+| Markdown 代码块、前后多余文字 | `PolicyError`（不剥壳、不截取） |
+| 工具名不在注册表里 | **放行**，由引擎记「未注册的工具」→ `RUN_FAILED` |
+
+**不变量**：
+
+1. `build_prompt` 只依赖 `view` 与工具集合；同一视图两次渲染逐字节相同。
+2. `ModelPolicy` 不保存提示、输出或步数；连续两次用同一视图 `decide`，两次提示相同。
+3. 客户端抛任何 `Exception` → `PolicyError`；一个工具都没调用，外部世界未变。
+4. 不可 JSON 化的 `args` 在提示里用 `repr` 兜底：提示不是日志，不承担可落盘承诺。
+
 ## 4. 依赖方向
 
 ```text
@@ -270,18 +312,20 @@ codec       → events                      （只做 JSON 转换，不判断顺
 tools       → 无内部依赖                   （不认识 model / events / journal，不写事件）
 journal     → events / codec              （分配 seq、落盘；不判断事件是否合法）
 policy      → model
+llm         → policy / model              （不认识工具实现、日志、引擎）
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
 reconcile   → journal / model / tools / events
 trace       → events / codec              （只读观察，不写日志、不判断合法性）
 cli         → engine / journal / policy / tools / reconcile / trace / ledger_tools / demo
 tests       → 全部
-scripts     → engine / policy / journal / ledger_tools / reconcile / demo
+scripts     → engine / policy / llm / journal / ledger_tools / reconcile / demo
 ```
 
 `model` 不得反向依赖 `demo`、`engine`、`journal`；`tools` 不得依赖 `model`；
 `ledger_tools` 不得写事件、不得分配 `seq`、不得重试、不得判断预算；
-`codec` 不得判断事件合法性，也不得依赖 `journal`。
+`codec` 不得判断事件合法性，也不得依赖 `journal`；`llm` 不得 import 任何模型 SDK、
+不得写日志、不得判断工具是否存在。
 
 ## 5. 学习者已确认的决策
 
@@ -316,15 +360,19 @@ scripts     → engine / policy / journal / ledger_tools / reconcile / demo
 | D27 | CLI 策略来源 | 读 JSON 脚本转成 `ScriptedPolicy`，用标准库 `argparse` | 2026-10-25 | 第 8 轮换模型策略时 CLI 不用动；不引 click，符合 D4 |
 | D28 | 观察者隔离方式 | `model.apply` 对 `args` 深拷贝，`TraceLine` 不携带 payload 引用 | 2026-10-25 | 浅拷贝挡不住嵌套改动；深拷贝的代价是每个 `STEP_DECIDED` 多一次复制 |
 | D29 | 校验失败的两种 kind | `invalid_args`（输入错）/ `validator_crashed`（工具自身 bug） | 2026-10-25 | 两者都归 FAILED（工具未执行），但只有后者需要改代码 |
+| D30 | 决策失败的落点 | `PolicyError` → `RUN_FAILED` + `StopReason.FAILED` | 2026-10-25 | 决策阶段零副作用，说“可能已生效”会毁掉 UNCERTAIN 的含义；代价是主循环多一个 `except` |
+| D31 | 模型输出解析 | 严格：不剥代码块、不截取花括号、不转类型 | 2026-10-25 | 容错会让“没按约定输出”变成“有时能跑”，日志里看不出差别；代价是真模型首次接入会在格式上失败几次 |
+| D32 | 工具是否存在的判定位置 | 仍由引擎判（`UnknownTool`），`llm` 不查注册表 | 2026-10-25 | 只有注册表知道答案；策略多查一次就会造出第二份“哪些工具可用”的事实 |
+| D33 | `ScriptExhausted` 的归属 | 继承 `PolicyError` | 2026-10-25 | 脚本用完与模型乱输出是同一类事：给不出动作。统一之后 CLI 由栈信息变成 `RUN_FAILED`（退出码 1） |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 200 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 236 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（34 files） |
-| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（13 source files，0 error） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（37 files） |
+| mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（14 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
 
@@ -333,23 +381,21 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 7 轮完成）
+- 时间：2026-10-25（第 8 轮完成）
 - 命令与结果：
-  - `pytest` → `200 passed`
+  - `pytest` → `236 passed`（新增 36 例：`test_llm.py` 33 例、引擎 2 例、策略 1 例）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `34 files already formatted`
-  - `mypy` → `Success: no issues found in 13 source files`
-  - `python scripts/ledger_demo.py` → 退出码 0；第一次 `1000/0 → 750/250`，
-    第二次 `750/250 → 750/250`（`lookup_request` 命中后直接结束）
-  - `python scripts/recovery_demo.py` → 退出码 0；重开数据库后 5 条事件与重放视图
-    均与关闭前相等；崩溃现场 3 条事件重放为 `RUNNING`、`attempts=1`、`outcome=None`
-  - `python scripts/reconcile_demo.py` → 退出码 0；崩溃现场 3 条事件 → 首次 resume
-    返回 `UNCERTAIN` 且余额不变 → 对账补记 step 1 → 再次 resume 跑完 8 条事件，
-    余额最终停在 `750/250`，转账只生效一次
-  - `python -m agentrun.cli run / status` → 退出码 0，事件 5 条，状态 `SUCCEEDED`
-  - `python -m agentrun.cli trace` → 5 行时间线，每行含序号、类型与一句话说明；
-    `--export trace.jsonl` 写出 5 行，每行可被 `decode_event` 读回
-- 未验证：CI 远端运行、真实模型、多进程并发
+  - `ruff format --check .` → `37 files already formatted`
+  - `mypy` → `Success: no issues found in 14 source files`
+  - `python scripts/model_policy_demo.py` → 退出码 0：场景 A 三份提示、8 条事件、
+    `SUCCEEDED`、余额 `750/250`；场景 B 只有 `RUN_STARTED` + `RUN_FAILED`、0 步、
+    余额 `1000/0`；场景 C 崩在第 1 步之后，重启后提示指纹同为 `6fec2dbedd27`，
+    续跑至 `SUCCEEDED`、余额 `750/250`
+  - `python -m agentrun.cli run`（脚本 `get_balance` + `finish`）→ `SUCCEEDED`，
+    退出码 0
+  - 同一 CLI 用只含 1 步的脚本跑新任务 → `RUN_FAILED`、退出码 1；改动前是未捕获的
+    `ScriptExhausted`
+- 未验证：CI 远端运行、真实模型服务、多进程并发
 
 ### 第 4 轮新增证据
 
@@ -373,10 +419,11 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | `replay` 信任调用方给定顺序 | 乱序输入不会被发现（`SqliteEventLog` 已用 `ORDER BY seq` 缓解，`replay` 本身仍不校验） | 接入外部事件源时 |
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
 | `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
-| `validate` 崩溃与参数不合法共用 `kind=invalid_args` | 日志无法区分“用户输入错”和“工具自身 bug” | 第 7 轮时间线 |
 | `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
 | `reconcile` 只能补记成功 | 查到记录才有补记路径；判定「确实没生效」需要别的证据来源 | 需要人工判定失败时 |
-| 策略不持久化 | `resume` 必须重新提供脚本，脚本不同则续跑行为不同 | 第 8 轮模型策略 |
+| 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
+| 提示没有长度预算 | 长 `result` 会把提示撑大，可能超出上下文 | 结果变长或接真实服务时 |
+| CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
 | CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
@@ -386,4 +433,4 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
-| `llm.py` | 模型适配器：把模型输出转成 `Action` | 第 8 轮 |
+| `model_client.py` | 真实模型客户端：HTTP、密钥、超时与重试策略 | 决定接真实服务时 |

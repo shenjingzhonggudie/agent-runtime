@@ -8,8 +8,10 @@
 - ``reconcile``：为悬空的那一步补记结论。
 - ``trace``：打印时间线，或把事件导出成 JSONL。
 
-策略不持久化：``ScriptedPolicy`` 只依赖 ``len(view.steps)``，所以 ``resume`` 需要
-重新给一份同样的脚本。这是刻意的——策略属于调用方，不属于日志。
+本入口只装配 ``ScriptedPolicy``：它只依赖 ``len(view.steps)``，所以 ``resume`` 需要
+重新给一份同样的脚本。这是刻意的——策略属于调用方，不属于日志。模型策略
+（``llm.ModelPolicy``）同样可以由调用方装配，但它需要一个模型客户端，本入口不负责
+连接模型服务。
 
 依赖方向：
     cli → {engine, journal, policy, tools, reconcile, ledger_tools, demo}

@@ -49,6 +49,15 @@ class Finish:
 Action = ToolCall | Finish
 
 
+class PolicyError(Exception):
+    """策略无法给出下一个合法的动作。
+
+    抛出它表示「这次决策失败了」，不是「工具失败了」：此时一个工具都还没被调用，
+    外部世界没有发生任何改变。引擎收到它会写 ``RUN_FAILED``，而不是 ``UNCERTAIN``
+    ——后者意味着「可能已经改了」，这里恰恰相反。
+    """
+
+
 class Policy(Protocol):
     """策略协议：给定当前视图，返回下一个动作。"""
 
@@ -61,14 +70,22 @@ class Policy(Protocol):
         Returns:
             Action: 要么调用工具，要么结束任务。
 
+        Raises:
+            PolicyError: 策略无法给出合法动作。引擎据此写 ``RUN_FAILED``，而不是让
+                进程带着半截状态崩掉。
+
         Notes:
             同一个视图必须给出同一个动作。策略不得修改 ``view``。
         """
         ...
 
 
-class ScriptExhausted(Exception):
-    """脚本已用完，但任务还没有结束。"""
+class ScriptExhausted(PolicyError):
+    """脚本已用完，但任务还没有结束。
+
+    它同样是「策略给不出动作」，因此继承 ``PolicyError``：引擎记 ``RUN_FAILED``，
+    不再让异常穿过主循环。脚本写短了是调用方的错误，不是引擎该猜测的情形。
+    """
 
 
 class ScriptedPolicy:

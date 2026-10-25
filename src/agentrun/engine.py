@@ -13,7 +13,7 @@ from enum import StrEnum
 from .events import EventType, make_step_key
 from .journal import EventLog
 from .model import RunStatus, RunView, replay
-from .policy import Finish, Policy
+from .policy import Finish, Policy, PolicyError
 from .tools import ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
 
 
@@ -22,6 +22,9 @@ class StopReason(StrEnum):
 
     注意它与 ``RunStatus`` 不是一回事：遇到 UNCERTAIN 时循环停了，但任务状态仍是
     RUNNING——事实不足，既不成功也不失败，等对账或人工判断（第 6 轮）。
+
+    FAILED 有两种来源，都满足「零副作用」：工具名未注册（配置错误）与策略给不出动作
+    （``PolicyError``）。不要把它们记成 UNCERTAIN——那只留给定不下来的时候。
     """
 
     SUCCEEDED = "SUCCEEDED"
@@ -150,8 +153,9 @@ class Engine:
             1. 已决策步数 ``len(view.steps) >= max_steps`` → 追加 RUN_EXHAUSTED，
                停止，原因 EXHAUSTED。**预算判断在问策略之前**，所以 ``max_steps=0``
                一次决策都不做。
-            2. 调 ``policy.decide(view)``。返回 ``Finish`` → 追加 RUN_SUCCEEDED，
-               停止，原因 SUCCEEDED。
+            2. 调 ``policy.decide(view)``。抛 ``PolicyError`` → 追加 RUN_FAILED，
+               停止，原因 FAILED。返回 ``Finish`` → 追加 RUN_SUCCEEDED，停止，原因
+               SUCCEEDED。
             3. 返回 ``ToolCall`` → 从注册表取工具；``UnknownTool`` → 追加
                RUN_FAILED，停止，原因 FAILED（配置错误，不是业务失败）。
             4. 追加 STEP_DECIDED（``step = len(view.steps) + 1``，
@@ -171,7 +175,12 @@ class Engine:
             if len(view.steps) >= max_steps:
                 self._log.append(run_id, EventType.RUN_EXHAUSTED, {"max_steps": max_steps})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.EXHAUSTED)
-            action = self._policy.decide(view)
+            try:
+                action = self._policy.decide(view)
+            except PolicyError as exc:
+                self._log.append(run_id, EventType.RUN_FAILED, {"reason": str(exc)})
+                return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
+
             if isinstance(action, Finish):
                 self._log.append(run_id, EventType.RUN_SUCCEEDED, {"answer": action.answer})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.SUCCEEDED)

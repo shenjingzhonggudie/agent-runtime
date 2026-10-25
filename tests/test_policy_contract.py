@@ -3,7 +3,7 @@
 import pytest
 
 from agentrun.model import RunStatus, RunView, StepView
-from agentrun.policy import Finish, ScriptedPolicy, ScriptExhausted, ToolCall
+from agentrun.policy import Finish, PolicyError, ScriptedPolicy, ScriptExhausted, ToolCall
 
 
 def view_with_steps(count: int) -> RunView:
@@ -47,3 +47,8 @@ def test_script_exhausted_raises() -> None:
 def test_finish_rejects_blank_answer() -> None:
     with pytest.raises(ValueError):
         Finish("   ")
+
+
+def test_script_exhausted_is_a_policy_error() -> None:
+    # 脚本用完与模型乱输出是同一件事：策略给不出动作，都必须走 RUN_FAILED
+    assert issubclass(ScriptExhausted, PolicyError)
