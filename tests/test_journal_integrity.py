@@ -1,6 +1,9 @@
 """日志完整性：读侧要验真，不能“读到多少算多少”。"""
 
 import sqlite3
+import subprocess
+import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +17,8 @@ from agentrun.model import InvalidEvent, replay
 
 RUN = "run-a"
 STARTED = {"task": "转账 250", "max_steps": 10}
+ROOT = Path(__file__).resolve().parents[1]
+PROBE = ROOT / "scripts" / "_probe_journal_read.py"
 
 
 def build_log(tmp_path: Path) -> tuple[SqliteEventLog, Path]:
@@ -105,6 +110,49 @@ def test_cli_status_reports_corrupted_journal(
 
     assert code == 2
     assert "事件日志不完整" in capsys.readouterr().out
+
+
+def test_concurrent_read_does_not_report_corruption(tmp_path: Path) -> None:
+    """一边写一边读：两条 SELECT 必须在同一个只读事务里，否则会误报缺尾。"""
+    db = tmp_path / "events.db"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            str(PROBE),
+            "writer",
+            "--db",
+            str(db),
+            "--count",
+            "600",
+        ],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        reader = subprocess.run(
+            [
+                sys.executable,
+                str(PROBE),
+                "reader",
+                "--db",
+                str(db),
+                "--count",
+                "600",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        writer.communicate(timeout=120)
+
+    assert writer.returncode == 0
+    assert reader.returncode == 0, reader.stdout + reader.stderr
+    assert "corrupted=0" in reader.stdout
 
 
 def test_encoded_body_can_be_written_by_hand(tmp_path: Path) -> None:

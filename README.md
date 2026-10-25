@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第 13 轮完成：多 worker 接管有了 epoch 栅栏，旧 worker 醒来后写不进日志。
+第 15 轮完成：日志读侧会验真，账本读改写有跨进程互斥。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -29,6 +29,8 @@
 - 多 worker：`--owner` 启用租约，每次写事件带 `epoch` 栅栏；租约过期后可被接管，旧 worker 的写入被拒绝（`LOST`），任务状态不变。
 - 栅栏只保护日志：它不能阻止旧 worker 已经发出的工具调用，那部分仍靠对账与复核兜底。
 - `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
+- 日志读侧验真：缺号、末尾被删、事件归属别的 `run_id` 一律抛 `JournalCorrupted`，不返回残缺序列；两次 SELECT 在同一个只读事务里，不会被并发写者插队。
+- 账本所有公开方法都在 `ledger.lock` 的跨进程独占锁里完成读改写；拿不到锁抛 `LedgerBusy`（**确定未生效**），工具层映射成「业务拒绝」而不是「结果未知」。锁由内核持有，进程被杀即释放。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
 

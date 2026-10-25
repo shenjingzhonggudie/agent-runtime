@@ -7,8 +7,8 @@
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 14 轮完成：日志完整性校验，读侧不再「读到多少算多少」 |
-| 已实现能力 | 包骨架、模拟账本、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
+| 当前里程碑 | 第 15 轮完成：账本跨进程互斥，读改写不再丢更新 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
 | 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
 | 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
 
@@ -31,6 +31,10 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
 │  ├─ crash_runner.py        进程级故障注入：os._exit 在三个窗口退出（测试夹具）
 │  ├─ lease_worker.py        租约 worker：hold / takeover 两个模式（测试夹具）
+│  ├─ ledger_hammer.py       账本并发夹具：连做 N 次转账 / 占住账本锁（测试夹具）
+│  ├─ _probe_ledger_race.py  探针：两进程并发转账，核对成功次数与记账条数
+│  ├─ _probe_lock.py         探针：文件锁的跨进程互斥与进程被杀后自动释放
+│  ├─ _probe_journal_read.py 探针兼夹具：一边写一边读，统计完整性误报
 │  └─ eval_suite.py          离线评测集：8 种结局一张表
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
@@ -67,6 +71,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    ├─ test_process_crash.py     进程级：三个窗口真退进程后由新进程恢复
    ├─ test_lease.py             租约：epoch、续租、过期、栅栏拒写、引擎失联
    ├─ test_journal_integrity.py 完整性：缺号、缺尾、跨 run 混入、CLI 报告损坏
+   ├─ test_ledger_concurrency.py 账本并发：两进程不丢更新、忙时零副作用、被杀后自释放
    ├─ test_process_takeover.py  接管：两个真实进程，旧 worker 醒来写入被拒
    ├─ test_trace.py             时间线：十一种事件可渲染、JSONL 可回读、不修改原事件
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
@@ -125,16 +130,26 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `Ledger(root, initial)` | 独占目录、初始余额 | 实例 | 已存在时忽略 `initial` |
+| `Ledger(root, initial, *, lock_timeout=5.0)` | 独占目录、初始余额、等锁上限 | 实例 | 已存在时忽略 `initial`；首次创建在锁内完成 |
 | `balance(owner)` | 账户名 | `int` | 未知账户为 0 |
 | `transfer(src,dst,amount,request_id)` | — | `None` | 非幂等；三条规则违反则 `LedgerRejected` 且零副作用 |
 | `save_receipt(request_id,text)` | — | `None` | 幂等，首写生效 |
 | `lookup(request_id)` | — | `Record \| None` | `None` 只表示“此刻查不到” |
+| `lock()` | — | 上下文管理器 | 取整账本独占锁；持锁期间不要再调公开方法 |
+| `ledger_lock(root, *, timeout)` | 账本目录、等锁上限 | 上下文管理器 | 跨进程独占锁；超时抛 `LedgerBusy` |
 | `LedgerRejected` | — | 异常 | **确定未生效** |
 | `LedgerCorrupted` | — | 异常 | 存储不可信；**不能**据此断言生效或未生效 |
+| `LedgerBusy` | — | 异常 | 等锁超时，**确定未生效**（写操作在拿锁之后才开始） |
 
-存储：`root/ledger.json`，写入用临时文件 + `fsync` + `os.replace`，保证余额与记录整体可见。
-读取时校验顶层结构与余额类型，不合法抛 `LedgerCorrupted`。
+存储：`root/ledger.json`，写入用临时文件 + `fsync` + `os.replace`，保证余额与记录整体可见；
+临时文件名带进程号，避免两个写者共用一个 `.tmp`。读取时校验顶层结构与余额类型，
+不合法抛 `LedgerCorrupted`。
+
+**并发不变量**：所有公开方法（含只读）都在 `root/ledger.lock` 的独占锁里完成读改写。
+读也排队，是因为 Windows 上 `os.replace` 会与「别人正打开目标文件」冲突——不排队就得
+靠重试把竞态藏起来。锁由内核持有（`msvcrt.locking` / `fcntl.flock`），进程死亡即释放，
+**不需要超时清理**：这是它与租约的根本差别，租约靠时间推断对方死没死，文件锁由操作
+系统直接作证。
 
 ### 3.4 工具（`tools.py`）
 
@@ -230,6 +245,9 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
    `run_id` 是否等于查询的 `run_id`、`runs.last_seq` 是否等于实际条数。任一不符
    抛 `JournalCorrupted`，不返回残缺序列。中间删除靠序号缺口发现，**末尾删除只能
    靠 `last_seq` 对账**：少一条的序列本身完全连续。
+3b. 这两次读取必须在**同一个只读事务**（`BEGIN … COMMIT`）里。`isolation_level=None`
+   下每条语句各自成事务，写者可以在两次之间提交，于是"元数据旧、事件新"——把一次
+   正常写入误报成损坏（探针实测 1500 次读误报 34 次；加事务后 0 次）。
 4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
    DEFERRED，两个连接会读到同一个 `last_seq`。
 5. **写栅栏**：`runs.owner` 非空时，`append` 必须携带 owner 与 epoch 都匹配的
@@ -480,14 +498,17 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D48 | 租约默认值 | `owner=None` 关闭租约；启用时 `lease_ttl=30`，每次写前续租 | 2026-10-25 | 单进程演示不该被并发语义拖慢；默认 30 秒覆盖一次工具调用，短了会误判失联 |
 | D49 | 完整性校验放在哪一层 | 序列完整性归日志（`JournalCorrupted`），事件语义与归属归 `model`（`InvalidEvent`） | 2026-10-25 | 只有日志知道「应有多少条」（`last_seq`），只有模型知道「这条事件什么意思」；放进任一侧都会让另一侧撒谎。代价是同一份损坏可能表现为两种异常 |
 | D50 | 日志损坏的出口 | 不映射成 `StopReason`，一路抛到调用方；CLI 退出码 2 | 2026-10-25 | 损坏既不是任务的结局，也不是 worker 的结局（对比 `LOST`）；做成状态机就会让「读不出来」伪装成「跑到这里」。代价是 engine 的调用方必须自己接住 |
+| D51 | 账本互斥放在哪一层 | 账本自己（`ledger_lock`），不放到引擎或工具层 | 2026-10-25 | 只有账本知道「一次业务由哪几步组成」；放到工具层，「读余额 → 转账」这种跨调用业务仍然不原子。代价是账本成为串行点 |
+| D52 | 拿不到账本锁的语义 | `LedgerBusy` → `ToolRejected`（`rejected`），不是 `UNCERTAIN` | 2026-10-25 | 锁在读写之前取得，没拿到就什么都没做；记成「可能已生效」会凭空造出一场对账和人工复核。前提是「取得锁早于任何副作用」，将来加缓存写入必须重新审这条 |
+| D53 | 只读是否排队 | 排队：`balance` / `lookup` 也取锁 | 2026-10-25 | Windows 上 `os.replace` 与「别人正打开目标文件」冲突，实测会抛 `WinError 32`，而它会被 `run_tool` 归成 `UNCERTAIN`——把「确定没生效」抬成「可能已生效」。代价是读吞吐下降 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 296 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 302 passed（连跑 6 遍无偶发失败） |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（49 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，Python 3.14 | 同上四条 | **配置已准备，未推送、未运行** |
 | Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
@@ -497,17 +518,18 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 14 轮完成）
+- 时间：2026-10-25（第 15 轮完成）
 - 命令与结果：
-  - `pytest` → `296 passed`（新增 8 例：缺号、缺尾、跨 run、CLI 报告、手工编码回读）
+  - `pytest` → `302 passed`（新增 6 例：丢更新、忙时零副作用、被杀后锁释放、工具映射、
+    并发读不误报）
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `49 files already formatted`
+  - `ruff format --check .` → `54 files already formatted`
   - `mypy` → `Success: no issues found in 15 source files`
-  - `tests/test_journal_integrity.py` → 删中间一条报「序号不连续」；删末尾一条报
-    `last_seq` 不符；把别的 run 的 body 塞进来报归属错；`replay` 混入陌生 run 报
-    `InvalidEvent`；CLI `status` 在损坏库上退出码 2 并打印「事件日志不完整」
-  - `python scripts/eval_suite.py` → `8/8 通过`
-- 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电
+  - `tests/test_ledger_concurrency.py` → 两个进程各 20 笔：修前一方报
+    `PermissionError WinError 32`、账本只记 20 笔；修后 40 笔全记，余额 600/400
+  - `scripts/_probe_ledger_race.py` → 两进程 × 20 笔，`balance=600/400 transfers=40`
+  - `python scripts/eval_suite.py` → `8/8 通过`（195 ms）
+- 未验证：真实模型服务、CI 远端运行、跨机器时钟、`kill -9` 与断电、账本锁的 POSIX 分支
 
 ### 第 4 轮新增证据
 
@@ -546,7 +568,9 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
 | CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
-| `_load → 改 → _save` 无锁 | 两个实例并发写会丢更新 | v2 并发 / 多进程演示 |
+| 账本锁的 POSIX 分支未验证 | `fcntl.flock` 那段代码本机跑不到，行为只按文档推断 | 在 Linux / macOS 上运行或 CI 加矩阵时 |
+| 账本锁是整文件粒度 | 两个不同账户的转账也互相排队；写操作等锁上限 5s | 账户数或并发度上升时 |
+| 账本锁只对同机进程有效 | NFS / SMB 上的文件锁语义不一，可能退化为不互斥 | 账本放到共享存储时 |
 | CI 未远端运行 | 流水线可用性未验证 | 建立 GitHub 远端 |
 | Docker 未引入 | 无容器化交付 | CLI 稳定 + 跨机需求 |
 

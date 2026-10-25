@@ -10,7 +10,7 @@
 from collections.abc import Mapping
 from typing import Any
 
-from .demo import Ledger, LedgerCorrupted, LedgerRejected
+from .demo import Ledger, LedgerBusy, LedgerCorrupted, LedgerRejected
 from .tools import InvalidArgs, SideEffect, ToolContext, ToolRejected
 
 
@@ -65,6 +65,8 @@ class GetBalance:
         owner = args["owner"]
         try:
             balance = self._ledger.balance(owner)
+        except LedgerBusy as exc:
+            raise ToolRejected(str(exc)) from exc
         except LedgerCorrupted as exc:
             raise ToolRejected(str(exc)) from exc
         return {"owner": owner, "balance": balance}
@@ -120,6 +122,7 @@ class Transfer:
 
         Raises:
             ToolRejected: 出现下列任一情况时抛出，且确定没有产生任何效果：
+                账本抛 ``LedgerBusy``——没拿到锁，锁在读写之前取得，一笔都没动；
                 账本抛 ``LedgerRejected``——业务明确拒绝（金额非正、余额不足、
                 触碰储备线），账本保证零副作用；账本抛 ``LedgerCorrupted``——
                 读盘发生在写盘之前，能证明没有生效。
@@ -134,6 +137,9 @@ class Transfer:
         amount = args["amount"]
         try:
             self._ledger.transfer(src, dst, amount, request_id=ctx.step_key)
+        except LedgerBusy as exc:
+            # 没拿到锁 = 一笔都没动，属于「确定未生效」，可以重试
+            raise ToolRejected(f"账本忙：{exc}") from exc
         except LedgerRejected as exc:
             raise ToolRejected(str(exc)) from exc
         except LedgerCorrupted as exc:
@@ -182,8 +188,8 @@ class SaveReceipt:
 
         Raises:
             ToolRejected: 出现下列任一情况时抛出，且确定没有产生任何效果：
-                账本抛 ``LedgerRejected``；账本抛 ``LedgerCorrupted``——读盘在
-                写盘之前，能证明没有生效。
+                账本抛 ``LedgerBusy``——没拿到锁；账本抛 ``LedgerRejected``；
+                账本抛 ``LedgerCorrupted``——读盘在写盘之前，能证明没有生效。
 
         Notes:
             幂等键不取自 ``args``，只取自本次调用的 ``ctx.step_key``。去重由账本
@@ -192,6 +198,8 @@ class SaveReceipt:
         text = args["text"]
         try:
             self._ledger.save_receipt(ctx.step_key, text)
+        except LedgerBusy as exc:
+            raise ToolRejected(f"账本忙：{exc}") from exc
         except LedgerRejected as exc:
             raise ToolRejected(str(exc)) from exc
         except LedgerCorrupted as exc:
@@ -252,6 +260,8 @@ class LookupRequest:
         request_id = args["request_id"]
         try:
             record = self._ledger.lookup(request_id)
+        except LedgerBusy as exc:
+            raise ToolRejected(f"账本忙：{exc}") from exc
         except LedgerCorrupted as exc:
             raise ToolRejected(str(exc)) from exc
         if record is None:

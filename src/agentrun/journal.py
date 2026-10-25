@@ -415,13 +415,23 @@ class SqliteEventLog:
             ``runs.last_seq`` 是"应有多少条"的独立证据：它在追加事务里与事件一起写入，
             正常情况下必然等于事件条数。两者不符说明记录被删过——中间删除会先被序号
             缺口抓到，末尾删除只有这条对账能抓。
+
+            两次 SELECT 必须在**同一个只读事务**里：``isolation_level=None`` 下每条
+            语句各自成事务，中间可以被写者插入一条提交，于是"元数据旧、事件新"，
+            校验会把一次正常写入误报成日志损坏（探针实测 1500 次读里误报 34 次）。
         """
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
             meta = conn.execute("SELECT last_seq FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             rows = conn.execute(
                 "SELECT seq, body FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 
