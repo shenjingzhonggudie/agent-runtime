@@ -18,6 +18,14 @@ from .model import Outcome, RunStatus, RunView, replay
 from .policy import Finish, Policy, PolicyError
 from .tools import Tool, ToolContext, ToolRegistry, ToolStatus, UnknownTool, run_tool
 
+MAX_DECISION_FAILURES = 3
+"""连续决策失败的上限。
+
+达到它就不再暂停，直接写 ``RUN_FAILED``：端点彻底挂掉时，留一个「随时可续跑」的
+任务，比留一个永远停在 ``RUNNING``、每次 ``resume`` 都再失败一次的任务诚实。取值
+是经验值——够扛住一次短暂抖动，又不至于让人对着不动的任务无限次手工续跑。
+"""
+
 
 class StopReason(StrEnum):
     """本次 ``Engine.run`` 为什么停下来。
@@ -33,10 +41,14 @@ class StopReason(StrEnum):
 
     ``LOST`` 表示本次工作期间租约被接管：写入被日志拒绝，任务状态仍是 ``RUNNING``
     （或由接管者推进）。这不是任务的结局，是这个 worker 的结局。
+
+    ``DECISION_FAILED`` 同样不是终态：策略这次没给出动作，但一个工具都没调用，外部
+    世界原封未动，任务仍是 ``RUNNING``。它与 ``FAILED`` 的差别只有一条——还值得再试。
     """
 
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    DECISION_FAILED = "DECISION_FAILED"
     EXHAUSTED = "EXHAUSTED"
     UNCERTAIN = "UNCERTAIN"
     WAITING_REVIEW = "WAITING_REVIEW"
@@ -50,6 +62,23 @@ class NothingToResume(Exception):
     抛出它表示调用方给错了 ``run_id``，而不是「任务已经跑完了」。已经跑完的任务
     走 ``Engine.resume`` 会正常返回现有视图，不会抛它。
     """
+
+
+def _is_retryable(error: PolicyError) -> bool:
+    """判断这次决策失败还能不能再试一次。
+
+    Args:
+        error: 策略抛出的失败。
+
+    Returns:
+        bool: True 表示值得从日志接着跑；False 表示重试也不会变好。
+
+    Notes:
+        只看 ``retryable`` 标记，不看异常类型、也不看消息文本：分类是抛出方的责任，
+        它才看得见状态码与解析结果。标记缺失时按不可重试处理——与 ``PolicyError``
+        的默认值一致，让「没表态」落在保守的一侧。
+    """
+    return bool(getattr(error, "retryable", False))
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +216,15 @@ class Engine:
 
         Raises:
             InvalidEvent: 事件序列非法（属于编程错误，不应在正常运行中出现）。
+            RunAlreadyStarted: 这个 ``run_id`` 已经有事件，不能重新启动。异常由日志
+                层抛出，此时 ``RUN_STARTED`` 没有写进去，任务状态原封不动。
             LeaseBusy: 配置了 ``owner``，但租约被其他 worker 持有。
 
         Notes:
             只负责写 ``RUN_STARTED``，随后把控制权交给 ``_drive``。同一个 ``run_id``
-            重复调用会再写一条 ``RUN_STARTED``，而 ``model.apply`` 会拒绝它——要接着
-            上次的进度继续，请用 ``resume``。
+            重复调用会在写日志时被挡住——拒绝发生在写入**之前**，而不是事后靠
+            ``model.apply`` 发现日志里多了一个起点。要接着上次的进度继续，请用
+            ``resume``。
         """
         self._acquire(run_id)
         try:
@@ -348,9 +380,11 @@ class Engine:
             1. 已决策步数 ``len(view.steps) >= max_steps`` → 追加 RUN_EXHAUSTED，
                停止，原因 EXHAUSTED。**预算判断在问策略之前**，所以 ``max_steps=0``
                一次决策都不做。
-            2. 调 ``policy.decide(view)``。抛 ``PolicyError`` → 追加 RUN_FAILED，
-               停止，原因 FAILED。返回 ``Finish`` → 追加 RUN_SUCCEEDED，停止，原因
-               SUCCEEDED。
+            2. 调 ``policy.decide(view)``。抛 ``PolicyError`` 时分两级：
+               ``retryable`` 为真且这次失败不会攒满 ``MAX_DECISION_FAILURES`` →
+               追加 DECISION_FAILED，停止，原因 DECISION_FAILED（非终态，可
+               ``resume``）；否则追加 RUN_FAILED，停止，原因 FAILED。返回
+               ``Finish`` → 追加 RUN_SUCCEEDED，停止，原因 SUCCEEDED。
             3. 返回 ``ToolCall`` → 从注册表取工具；``UnknownTool`` → 追加
                RUN_FAILED，停止，原因 FAILED（配置错误，不是业务失败）。
             4. 追加 STEP_DECIDED（``step = len(view.steps) + 1``，
@@ -373,6 +407,16 @@ class Engine:
             try:
                 action = self._policy.decide(view)
             except PolicyError as exc:
+                failures = view.decision_failures
+                if _is_retryable(exc) and failures + 1 < MAX_DECISION_FAILURES:
+                    self._append(
+                        run_id,
+                        EventType.DECISION_FAILED,
+                        {"reason": str(exc), "attempt": failures + 1},
+                    )
+                    return EngineResult(
+                        view=self._view(run_id), stop_reason=StopReason.DECISION_FAILED
+                    )
                 self._append(run_id, EventType.RUN_FAILED, {"reason": str(exc)})
                 return EngineResult(view=self._view(run_id), stop_reason=StopReason.FAILED)
 

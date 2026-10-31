@@ -102,12 +102,18 @@ class ReviewView:
         decision: 复核结论；``None`` 表示仍在等待。取值 ``applied`` / ``not_applied``
             / ``abort``。
         note: 复核依据；等待中为 ``None``。
+        resolution_id: 写入方给的幂等键；``None`` 表示这次提交没有带键（旧日志或
+            不关心重复的调用方）。同一个键重复提交时，日志里只会有一条结论。
+        resolved_at: 结论写入时刻（ISO-8601 UTC，来自事件的 ``at``）；等待中为
+            ``None``。它只用于回答「是谁在什么时候处理的」，不参与任何判定。
     """
 
     step: int
     reason: str
     decision: str | None = None
     note: str | None = None
+    resolution_id: str | None = None
+    resolved_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +134,9 @@ class RunView:
             None 表示仍在等待，此时 ``status`` 必为 ``WAITING_REVIEW``。
         failure_reason: ``RUN_FAILED`` 携带的原因；其他路径为 None。保留原文，方便
             CLI 与日志直接回答「为什么失败」，不必再去翻事件。
+        decision_failures: 连续决策失败次数，由 ``DECISION_FAILED`` 累加、由
+            ``STEP_DECIDED`` 与 ``RUN_SUCCEEDED`` 清零。它**不是**重试预算：攒到上限
+            的动作由引擎决定，视图只负责如实记录。
     """
 
     run_id: str
@@ -139,6 +148,7 @@ class RunView:
     answer: str | None = None
     review: ReviewView | None = None
     failure_reason: str | None = None
+    decision_failures: int = 0
 
 
 def _field(event: Event, name: str, kind: type | tuple[type, ...]) -> Any:
@@ -154,6 +164,32 @@ def _field(event: Event, name: str, kind: type | tuple[type, ...]) -> Any:
         raise InvalidEvent(f"{event.type} 的字段 {name!r} 类型不符")
     if not isinstance(value, kind):
         raise InvalidEvent(f"{event.type} 的字段 {name!r} 类型不符")
+    return value
+
+
+def _field_optional(event: Event, name: str) -> str | None:
+    """读取可选的非空字符串字段。
+
+    Args:
+        event: 待折叠的事件。
+        name: payload 字段名。
+
+    Returns:
+        str | None: 字段值；payload 里没有这个键时为 ``None``。
+
+    Raises:
+        InvalidEvent: 字段存在但不是字符串，或去空白后为空。
+
+    Notes:
+        「缺失」与「空白」必须分开：前者是旧日志（加入这个字段之前写下的事件），
+        必须能原样读回；后者是写入方给了一个没有意义的键，属于契约违反。把两者都
+        归成 ``None`` 会让脏数据静默通过，而这段日志以后再也分不清是谁写的。
+    """
+    if name not in event.payload:
+        return None
+    value = event.payload[name]
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidEvent(f"{event.type} 的字段 {name!r} 必须是非空字符串")
     return value
 
 
@@ -190,7 +226,10 @@ def apply(view: RunView | None, event: Event) -> RunView:
             ``RUN_SUCCEEDED`` 的 answer 去空白后为空；
             等待复核时追加非 ``REVIEW_RESOLVED`` 的事件；
             ``REVIEW_REQUESTED`` 指向的步骤不是「已开始、无结果或结果未知」；
-            ``REVIEW_RESOLVED`` 的 step、decision、note、result 与契约不符。
+            ``REVIEW_RESOLVED`` 的 step、decision、note、result 与契约不符，或可选的
+            ``resolution_id`` 存在却不是非空字符串；
+            ``DECISION_FAILED`` 的 reason 去空白后为空、``attempt`` 不等于当前连续
+            失败次数 + 1，或此时仍有「已开始、没有结果」的步骤（那该走复核）。
 
     Notes:
         预算耗尽（RUN_EXHAUSTED）不是成功，也不能写入 answer；它和 RUN_FAILED
@@ -227,6 +266,27 @@ def apply(view: RunView | None, event: Event) -> RunView:
     if view.status is RunStatus.WAITING_REVIEW and event.type is not EventType.REVIEW_RESOLVED:
         raise InvalidEvent(f"任务在等待人工复核，只接受 REVIEW_RESOLVED：{event.type}")
 
+    if event.type == EventType.DECISION_FAILED:
+        reason = _field(event, "reason", str)
+        if not reason.strip():
+            raise InvalidEvent("DECISION_FAILED 的 reason 去空白后为空")
+        attempt = _field(event, "attempt", int)
+        pending = next(
+            (
+                item.step
+                for item in view.steps
+                if item.attempts > 0 and (item.outcome is None or item.outcome is Outcome.UNCERTAIN)
+            ),
+            None,
+        )
+        if pending is not None:
+            raise InvalidEvent(f"步骤 {pending} 已开始且没有结果，该走复核，不能当作决策失败")
+        if attempt != view.decision_failures + 1:
+            raise InvalidEvent(
+                f"DECISION_FAILED 的 attempt 必须是 {view.decision_failures + 1}，当前为 {attempt}"
+            )
+        return replace(view, last_seq=event.seq, decision_failures=view.decision_failures + 1)
+
     if event.type == EventType.STEP_DECIDED:
         step = _field(event, "step", int)
         tool = _field(event, "tool", str)
@@ -236,7 +296,13 @@ def apply(view: RunView | None, event: Event) -> RunView:
             raise InvalidEvent(f"step 必须是 {len(view.steps) + 1}，当前为 {step}")
         # 深拷贝：args 里允许嵌套 dict/list，浅拷贝挡不住观察者改内层
         new_step = StepView(step=step, tool=tool, args=deepcopy(dict(args)), step_key=step_key)
-        return replace(view, last_seq=event.seq, steps=view.steps + (new_step,))
+        # 真的拿到动作即清零：计数衡量的是「连续」失败，不是累计失败
+        return replace(
+            view,
+            last_seq=event.seq,
+            steps=view.steps + (new_step,),
+            decision_failures=0,
+        )
 
     if event.type == EventType.STEP_STARTED:
         current = _step_at(view, _field(event, "step", int))
@@ -271,7 +337,13 @@ def apply(view: RunView | None, event: Event) -> RunView:
         answer = _field(event, "answer", str)
         if not answer.strip():
             raise InvalidEvent("RUN_SUCCEEDED 的 answer 去空白后为空")
-        return replace(view, last_seq=event.seq, status=RunStatus.SUCCEEDED, answer=answer)
+        return replace(
+            view,
+            last_seq=event.seq,
+            status=RunStatus.SUCCEEDED,
+            answer=answer,
+            decision_failures=0,
+        )
 
     if event.type == EventType.RUN_FAILED:
         reason = _field(event, "reason", str)
@@ -327,7 +399,13 @@ def apply(view: RunView | None, event: Event) -> RunView:
         resolved_outcome = current.outcome is None or current.outcome is Outcome.UNCERTAIN
         if current.attempts == 0 or not resolved_outcome:
             raise InvalidEvent(f"步骤 {step} 不需要复核结论")
-        resolved = replace(review, decision=decision, note=note)
+        resolved = replace(
+            review,
+            decision=decision,
+            note=note,
+            resolution_id=_field_optional(event, "resolution_id"),
+            resolved_at=event.at,
+        )
 
         if decision == "abort":
             if "result" in event.payload:

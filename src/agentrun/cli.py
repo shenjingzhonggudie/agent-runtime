@@ -2,20 +2,19 @@
 
 六个子命令，各自只做一件事：
 
-- ``run``：从 JSON 脚本跑一个新任务。
+- ``run``：从 JSON 脚本或模型决策跑一个新任务。
 - ``resume``：在已有日志上继续跑。
 - ``status``：打印视图与每一步的当前状态。
 - ``reconcile``：为悬空的那一步补记结论；查不到则提交人工复核。
 - ``resolve``：写下人工复核结论（applied / not_applied / abort）。
 - ``trace``：打印时间线，或把事件导出成 JSONL。
 
-本入口只装配 ``ScriptedPolicy``：它只依赖 ``len(view.steps)``，所以 ``resume`` 需要
-重新给一份同样的脚本。这是刻意的——策略属于调用方，不属于日志。模型策略
-（``llm.ModelPolicy``）同样可以由调用方装配，但它需要一个模型客户端，本入口不负责
-连接模型服务。
+默认装配 ``ScriptedPolicy``，保持原有脚本命令兼容；``--policy model`` 则从本地配置与环境变量
+构造客户端并装配 ``ModelPolicy``。脚本模式续跑仍需提供脚本；模型模式从日志中的任务
+与历史步骤重新决策，不需要脚本。工具始终经注册表与引擎执行。
 
 依赖方向：
-    cli → {engine, journal, policy, tools, reconcile, ledger_tools, demo}
+    cli → {engine, journal, policy, llm, model_client, tools, reconcile, ledger_tools, demo}
 """
 
 import argparse
@@ -27,22 +26,49 @@ from typing import Any
 
 from .demo import Ledger
 from .engine import Engine, NothingToResume, StopReason
-from .journal import JournalCorrupted, Lease, LeaseBusy, SqliteEventLog
+from .journal import JournalCorrupted, Lease, LeaseBusy, RunAlreadyStarted, SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
+from .llm import ModelPolicy, ToolSpec
 from .model import REVIEW_DECISIONS, InvalidEvent, RunView, replay
-from .policy import Action, Finish, ScriptedPolicy, ToolCall
+from .model_client import ModelClientError, client_from_env
+from .policy import Action, Finish, Policy, ScriptedPolicy, ToolCall
 from .reconcile import (
     NothingToReconcile,
     NothingToResolve,
     pending_step,
     reconcile,
-    resolve,
+    resolve_review,
 )
 from .tools import ToolRegistry
 from .trace import export_jsonl, timeline
 
 DEFAULT_DB = Path("agentrun.db")
 DEFAULT_LEDGER = Path("ledger")
+LEDGER_TOOL_SPECS = (
+    ToolSpec(
+        "get_balance",
+        "查询账户余额。参数 owner: str，必需且非空；只读，无业务副作用。"
+        "返回 owner: str、balance: int；未知账户余额为 0。",
+    ),
+    ToolSpec(
+        "transfer",
+        "转账。参数 src: str、dst: str，必需且非空；amount: int，必需且大于 0，"
+        "不接受 bool。非幂等写操作，重复调用会重复转账；结果未知时不得自动重做。"
+        "返回 request_id、src、dst、amount；request_id 由引擎生成，无需传入。",
+    ),
+    ToolSpec(
+        "save_receipt",
+        "保存回执。参数 text: str，必需且非空。幂等写操作：同一引擎 step_key "
+        "重复调用只保存首次内容；不同步骤使用不同键。返回 request_id、text；"
+        "request_id 由引擎生成，无需传入。",
+    ),
+    ToolSpec(
+        "lookup_request",
+        "查询已生效的操作。参数 request_id: str，必需且非空。只读，无业务副作用。"
+        "查到返回 found: true、kind: str、amount: int；未查到返回 found: false，"
+        "不能据此断言操作从未生效。",
+    ),
+)
 
 
 def build_registry(ledger_path: Path) -> ToolRegistry:
@@ -115,6 +141,8 @@ def print_view(view: RunView) -> None:
         print(f"答案：{view.answer}")
     if view.failure_reason is not None:
         print(f"失败原因：{view.failure_reason}")
+    if view.decision_failures:
+        print(f"决策失败：{view.decision_failures} 次（任务仍可 resume）")
     for step in view.steps:
         outcome = step.outcome.value if step.outcome is not None else "-"
         print(f"  {step.step:>2}  {step.tool:<14} attempts={step.attempts} outcome={outcome}")
@@ -142,12 +170,25 @@ def exit_code_for(stop: StopReason) -> int:
     return 0 if stop is StopReason.SUCCEEDED else 1
 
 
+def build_policy(args: argparse.Namespace, *, new_run: bool) -> Policy:
+    """校验策略参数并构造策略；在创建日志或账本之前暴露配置错误。"""
+    if args.policy == "script":
+        if args.script is None:
+            raise ValueError("script 模式必须提供 --script")
+        return ScriptedPolicy(load_actions(args.script))
+    if args.script is not None:
+        raise ValueError("model 模式不能同时提供 --script")
+    if new_run and not args.task.strip():
+        raise ValueError("model 模式的新任务必须提供非空 --task")
+    return ModelPolicy(client_from_env(), LEDGER_TOOL_SPECS)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """执行 ``run`` 子命令。"""
-    actions = load_actions(args.script)
+    policy = build_policy(args, new_run=True)
     log = SqliteEventLog(args.db)
     engine = Engine(
-        ScriptedPolicy(actions),
+        policy,
         build_registry(args.ledger),
         log,
         owner=args.owner,
@@ -155,6 +196,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     try:
         result = engine.run(args.run_id, args.task or args.run_id, args.max_steps)
+    except RunAlreadyStarted as exc:
+        print(f"任务已存在：{exc}")
+        print("要接着上次的进度跑，请用 resume；只想看现状，请用 status。")
+        return 2
     except LeaseBusy as exc:
         print(f"没有拿到租约：{exc}")
         return 2
@@ -165,10 +210,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     """执行 ``resume`` 子命令。"""
-    actions = load_actions(args.script)
+    policy = build_policy(args, new_run=False)
     log = SqliteEventLog(args.db)
     engine = Engine(
-        ScriptedPolicy(actions),
+        policy,
         build_registry(args.ledger),
         log,
         owner=args.owner,
@@ -255,18 +300,24 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
     log = SqliteEventLog(args.db)
     try:
-        view = resolve(
+        outcome = resolve_review(
             log,
             args.run_id,
             decision=args.decision,
             note=args.note,
             result=result,
+            resolution_id=args.resolution_id,
         )
     except NothingToResolve as exc:
         print(f"无法复核：{exc}")
         return 2
 
-    print_view(view)
+    if not outcome.recorded:
+        # 重复提交按成功处理：网关重试与手抖双击不该让调用方以为出了问题
+        print(outcome.detail)
+        return 0 if outcome.duplicate else 2
+
+    print_view(outcome.view)
     return 0
 
 
@@ -291,10 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentrun", description="事件溯源执行引擎")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run_p = sub.add_parser("run", help="从脚本跑一个新任务")
+    run_p = sub.add_parser("run", help="从脚本或模型决策跑一个新任务")
     run_p.add_argument("--run-id", required=True)
-    run_p.add_argument("--script", required=True, type=Path)
-    run_p.add_argument("--task", default="")
+    run_p.add_argument("--policy", choices=("script", "model"), default="script")
+    run_p.add_argument("--script", type=Path, help="script 模式必需；model 模式不可使用")
+    run_p.add_argument("--task", default="", help="任务描述；model 模式必需且非空")
     run_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     run_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     run_p.add_argument("--max-steps", type=int, default=10)
@@ -304,7 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume_p = sub.add_parser("resume", help="接着上次的进度继续")
     resume_p.add_argument("--run-id", required=True)
-    resume_p.add_argument("--script", required=True, type=Path)
+    resume_p.add_argument("--policy", choices=("script", "model"), default="script")
+    resume_p.add_argument("--script", type=Path, help="script 模式必需；model 模式从日志恢复")
     resume_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
     resume_p.add_argument("--lease-ttl", type=float, default=30.0)
     resume_p.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -327,6 +380,11 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_p.add_argument("--decision", required=True, choices=REVIEW_DECISIONS)
     resolve_p.add_argument("--note", required=True, help="复核依据：谁、看了什么、为什么")
     resolve_p.add_argument("--result", default=None, help="applied 时的外部事实（JSON 对象）")
+    resolve_p.add_argument(
+        "--resolution-id",
+        default=None,
+        help="幂等键；同一个键重复提交只写一次结论，重复的那次按成功返回",
+    )
     resolve_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     resolve_p.set_defaults(func=cmd_resolve)
 
@@ -356,6 +414,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     func = args.func
     try:
         return int(func(args))
+    except ModelClientError:
+        # 配置异常也可能来自第三方客户端，不原样输出异常，避免凭据进入终端。
+        print(
+            "模型配置错误：请检查 AGENTRUN_BASE_URL、AGENTRUN_API_KEY、"
+            "AGENTRUN_MODEL 和 AGENTRUN_TIMEOUT"
+        )
+        return 2
     except JournalCorrupted as exc:
         print(f"事件日志不完整：{exc}")
         return 2

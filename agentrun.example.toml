@@ -1,0 +1,6 @@
+[model]
+base_url = "https://api.deepseek.com"
+api_key = "在本地配置中填写自己的密钥"
+model = "deepseek-flash"
+timeout = 60.0
+reasoning_effort = "none"

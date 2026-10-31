@@ -51,6 +51,8 @@ def summarize(event: Event) -> str:
 
     if kind is EventType.RUN_STARTED:
         return f"任务「{payload.get('task', '')}」开始，预算 {payload.get('max_steps')} 步"
+    if kind is EventType.DECISION_FAILED:
+        return f"第 {payload.get('attempt')} 次决策失败：{payload.get('reason', '')}"
     if kind is EventType.STEP_DECIDED:
         return f"决定第 {payload.get('step')} 步：{payload.get('tool')} {payload.get('args')}"
     if kind is EventType.STEP_STARTED:

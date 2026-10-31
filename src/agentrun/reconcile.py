@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .events import Event, EventType
-from .journal import EventLog
+from .journal import Conflict, EventLog
 from .model import REVIEW_DECISIONS, Outcome, RunStatus, RunView, replay
 from .tools import Tool, ToolContext, ToolStatus, run_tool
 
@@ -56,6 +56,24 @@ class ReconcileResult:
     event: Event | None
     detail: str
     requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveResult:
+    """一次复核结论提交的结果。
+
+    Attributes:
+        view: 提交之后的视图；无论本次是否真的写入，都反映日志的当前状态。
+        recorded: 本次调用是否真的追加了一条 ``REVIEW_RESOLVED``。
+        duplicate: 同一个 ``resolution_id`` 之前已经写过。这是网关重试或重复点击，
+            事实没有变化，第二次不该报错。
+        detail: 给人看的说明，可直接打印。
+    """
+
+    view: RunView
+    recorded: bool
+    duplicate: bool
+    detail: str
 
 
 def pending_step(view: RunView) -> int | None:
@@ -153,15 +171,51 @@ def reconcile(log: EventLog, run_id: str, lookup: Tool) -> ReconcileResult:
     return ReconcileResult(recorded=True, event=event, detail=f"已补记 step {step} 为成功")
 
 
-def resolve(
+def _existing_resolution(view: RunView, resolution_id: str | None) -> ResolveResult | None:
+    """视图里已经有结论时，把「早就处理过了」说清楚。
+
+    Args:
+        view: 当前视图。
+        resolution_id: 本次提交携带的幂等键；``None`` 表示调用方不关心重复。
+
+    Returns:
+        ResolveResult | None: 已经有结论时返回 ``recorded=False`` 的结果；仍停留在
+        等待结论时返回 ``None``。
+
+    Notes:
+        「同一个键」与「不同的键」必须分开答复。前者是重复提交，事实没有变化，调用方
+        该按成功处理；后者是先后两次人工操作，晚到的那个需要知道**已经发生了什么**，
+        而不是收到一句「没有待复核的步骤」——那句话会让人以为任务丢了。
+    """
+    if view.review is None or view.review.decision is None:
+        return None
+    done = view.review
+    if resolution_id is not None and done.resolution_id == resolution_id:
+        return ResolveResult(
+            view=view,
+            recorded=False,
+            duplicate=True,
+            detail=f"重复提交：resolution_id={resolution_id} 的结论已生效（{done.decision}）",
+        )
+    when = done.resolved_at or "时间未知"
+    return ResolveResult(
+        view=view,
+        recorded=False,
+        duplicate=False,
+        detail=f"已被处理：step {done.step} → {done.decision}（{when}；{done.note}）",
+    )
+
+
+def resolve_review(
     log: EventLog,
     run_id: str,
     *,
     decision: str,
     note: str,
     result: Mapping[str, Any] | None = None,
-) -> RunView:
-    """写下人工复核结论，返回复核后的视图。
+    resolution_id: str | None = None,
+) -> ResolveResult:
+    """写下人工复核结论，并说明这次到底发生了什么。
 
     Args:
         log: 事件日志；结论会追加到它。
@@ -169,27 +223,33 @@ def resolve(
         decision: ``applied`` / ``not_applied`` / ``abort``，见 ``REVIEW_DECISIONS``。
         note: 复核依据：谁、看了什么证据、为什么这样判断。去空白后不得为空。
         result: 仅 ``applied`` 需要，记录查实的外部事实（通常来自账本）。
+        resolution_id: 幂等键。同一个键重复提交只有第一次写事件，其余返回
+            ``duplicate=True``；省略时不做幂等判断。
 
     Returns:
-        RunView: 写入结论之后的视图。``applied`` / ``not_applied`` 回到 ``RUNNING``，
-        ``abort`` 进入终态 ``ABORTED``。
+        ResolveResult: 视图、是否真的写入、是否为重复提交，以及一句说明。
 
     Raises:
-        ValueError: 结论不在允许集合、依据为空、或 ``result`` 与结论不匹配。
-        NothingToResolve: 任务不在 ``WAITING_REVIEW``，或结论已经写过。
+        ValueError: 结论不在允许集合、依据为空、``resolution_id`` 为空白，或
+            ``result`` 与结论不匹配。
+        NothingToResolve: 任务不存在，或当前既没有待复核步骤、也没有历史结论。
 
     Notes:
-        ``not_applied`` 只是记录「这一步确实没生效」，并不自动重做；是否重做由策略在
-        下一次决策里决定，重做会是一个新步骤、新的 ``step_key``。同一步骤的 ``step_key``
-        不能复用——那会把「第二次调用」伪装成「第一次的重试」。
+        提交是「读视图 → 追加」两步，所以追加时带上 ``expect_seq``：两个请求都读到
+        同一份视图时，只有先到的能落地，后到的收到 ``Conflict`` 后重读一次，于是得到
+        「已被处理」而不是把第二条结论写进日志。
 
-        ``abort`` 不改变该步的 ``outcome``：没有证据就是没有证据，终止状态本身已经
-        表达了「不再继续」。
+        这一条是整个防重的关键。没有它，双击会让日志出现两条 ``REVIEW_RESOLVED``，
+        此后 ``replay`` 永远抛 ``InvalidEvent``，任务再也读不出来——不是多一条记录，
+        是整个任务作废。
     """
     if decision not in REVIEW_DECISIONS:
         raise ValueError(f"未知的复核结论：{decision!r}，可选 {REVIEW_DECISIONS}")
     if not note.strip():
         raise ValueError("复核依据不能为空")
+    if resolution_id is not None and not resolution_id.strip():
+        raise ValueError("resolution_id 不能为空白字符串")
+    payload_result: dict[str, Any] | None
     if decision == "applied":
         if not isinstance(result, Mapping):
             raise ValueError("applied 必须提供 result（查实的外部事实）")
@@ -202,16 +262,86 @@ def resolve(
     events = log.read(run_id)
     if not events:
         raise NothingToResolve(f"没有这个任务：{run_id!r}")
+
     view = replay(events)
+    existing = _existing_resolution(view, resolution_id)
+    if existing is not None:
+        return existing
     if view.status is not RunStatus.WAITING_REVIEW or view.review is None:
         raise NothingToResolve(f"{run_id!r} 没有待复核的步骤（当前状态 {view.status}）")
 
-    payload: dict[str, Any] = {
-        "step": view.review.step,
-        "decision": decision,
-        "note": note,
-    }
+    step = view.review.step
+    payload: dict[str, Any] = {"step": step, "decision": decision, "note": note}
     if payload_result is not None:
         payload["result"] = payload_result
-    log.append(run_id, EventType.REVIEW_RESOLVED, payload)
-    return replay(log.read(run_id))
+    if resolution_id is not None:
+        payload["resolution_id"] = resolution_id
+
+    try:
+        log.append(run_id, EventType.REVIEW_RESOLVED, payload, expect_seq=view.last_seq)
+    except Conflict:
+        # 读完之后有人先落了笔：重读一次，把它的结论如实报出来
+        raced = _existing_resolution(replay(log.read(run_id)), resolution_id)
+        if raced is not None:
+            return raced
+        raise NothingToResolve(f"{run_id!r} 的复核状态在提交期间被改动，请重读后再试") from None
+
+    return ResolveResult(
+        view=replay(log.read(run_id)),
+        recorded=True,
+        duplicate=False,
+        detail=f"已写入复核结论：step {step} → {decision}",
+    )
+
+
+def resolve(
+    log: EventLog,
+    run_id: str,
+    *,
+    decision: str,
+    note: str,
+    result: Mapping[str, Any] | None = None,
+    resolution_id: str | None = None,
+) -> RunView:
+    """写下人工复核结论，返回复核后的视图。
+
+    Args:
+        log: 事件日志；结论会追加到它。
+        run_id: 任务标识。
+        decision: ``applied`` / ``not_applied`` / ``abort``，见 ``REVIEW_DECISIONS``。
+        note: 复核依据：谁、看了什么证据、为什么这样判断。去空白后不得为空。
+        result: 仅 ``applied`` 需要，记录查实的外部事实（通常来自账本）。
+        resolution_id: 幂等键，同 ``resolve_review``。
+
+    Returns:
+        RunView: 写入结论之后的视图。``applied`` / ``not_applied`` 回到 ``RUNNING``，
+        ``abort`` 进入终态 ``ABORTED``。
+
+    Raises:
+        ValueError: 结论不在允许集合、依据为空、或 ``result`` 与结论不匹配。
+        NothingToResolve: 这次没有真的写进去——任务不在 ``WAITING_REVIEW``、结论已经
+            写过，或提交期间被别人抢先。
+
+    Notes:
+        这是 ``resolve_review`` 的薄封装：只要结论没有落地就抛异常。需要区分「重复
+        提交」与「被别人抢先」的调用方应当直接用 ``resolve_review``，那里的两种情形
+        是返回值而不是异常。
+
+        ``not_applied`` 只是记录「这一步确实没生效」，并不自动重做；是否重做由策略在
+        下一次决策里决定，重做会是一个新步骤、新的 ``step_key``。同一步骤的 ``step_key``
+        不能复用——那会把「第二次调用」伪装成「第一次的重试」。
+
+        ``abort`` 不改变该步的 ``outcome``：没有证据就是没有证据，终止状态本身已经
+        表达了「不再继续」。
+    """
+    outcome = resolve_review(
+        log,
+        run_id,
+        decision=decision,
+        note=note,
+        result=result,
+        resolution_id=resolution_id,
+    )
+    if not outcome.recorded:
+        raise NothingToResolve(outcome.detail)
+    return outcome.view

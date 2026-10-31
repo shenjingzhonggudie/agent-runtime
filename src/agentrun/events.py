@@ -7,6 +7,9 @@
 各事件的 payload 字段（第 1B 轮契约）：
 
 - ``RUN_STARTED``：``task: str``、``max_steps: int >= 0``
+- ``DECISION_FAILED``：``reason: str``（去空白后不得为空）、``attempt: int``
+  （等于当前连续失败次数 + 1）。它**不是终态**：任务仍是 ``RUNNING``，可以由
+  ``resume`` 接着跑；只允许在没有悬挂步骤时出现，否则该走复核而不是重试。
 - ``STEP_DECIDED``：``step: int``（从 1 开始）、``tool: str``、``args: dict``、
   ``step_key: str``
 - ``STEP_STARTED``：``step: int``、``attempt: int``（从 1 开始）
@@ -19,7 +22,8 @@
 - ``REVIEW_REQUESTED``：``step: int``、``reason: str``（去空白后不得为空）
 - ``REVIEW_RESOLVED``：``step: int``、``decision: str``（``applied`` / ``not_applied`` /
   ``abort``）、``note: str``（去空白后不得为空）；``decision == "applied"`` 时另带
-  ``result: dict``，其余决策不得携带
+  ``result: dict``，其余决策不得携带；``resolution_id: str`` 可选，给出时去空白后不得
+  为空，是调用方的幂等键——同一个键只允许产生一条结论，重复提交不写事件
 
 顺序约定：``seq`` 从 1 开始连续递增，是唯一的排序依据；``at`` 只供人阅读，
 不参与任何判定（时钟回拨、时区差异都不该改变重放结果）。
@@ -35,6 +39,7 @@ class EventType(StrEnum):
     """事件类型。字符串值即日志中保存的稳定标识，不要随意改名。"""
 
     RUN_STARTED = "RUN_STARTED"
+    DECISION_FAILED = "DECISION_FAILED"
     STEP_DECIDED = "STEP_DECIDED"
     STEP_STARTED = "STEP_STARTED"
     STEP_COMPLETED = "STEP_COMPLETED"

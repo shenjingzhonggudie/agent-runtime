@@ -53,9 +53,23 @@ class PolicyError(Exception):
     """策略无法给出下一个合法的动作。
 
     抛出它表示「这次决策失败了」，不是「工具失败了」：此时一个工具都还没被调用，
-    外部世界没有发生任何改变。引擎收到它会写 ``RUN_FAILED``，而不是 ``UNCERTAIN``
-    ——后者意味着「可能已经改了」，这里恰恰相反。
+    外部世界没有发生任何改变。引擎收到它时，按 ``retryable`` 决定写
+    ``DECISION_FAILED``（还能再试）还是 ``RUN_FAILED``（到此为止），但两种情况都
+    不会写 ``UNCERTAIN``——后者意味着「可能已经改了」，这里恰恰相反。
+
+    Args:
+        message: 失败原因。它会进入事件日志，不要携带凭据或整段提示。
+        retryable: 这次失败是否值得再试一次。默认 ``False``：保守的一侧，让「没有
+            想清楚该不该重试」的实现落在不重试上，避免把确定性错误拖成无限重试。
+
+    Attributes:
+        retryable: 与构造参数一致。引擎只读这个标记，不按异常类型二次猜测——
+            分类是抛出方的责任（状态码、解析结果），不是接收方的。
     """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class Policy(Protocol):

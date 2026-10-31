@@ -8,7 +8,11 @@ version = "0.1.0.dev0"
 description = "Event-sourced Agent task execution engine (learning project)"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "httpx>=0.28,<1",
+    "langchain-openai>=1.0,<2",
+    "pydantic>=2.7.4,<3",
+]
 
 [project.scripts]
 agentrun = "agentrun.cli:main"

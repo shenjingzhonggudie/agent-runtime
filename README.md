@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-第 16 轮完成：租约会被主动归还，`status` 能看见谁占着任务。
+展示入口使用 DeepSeek 真实模型：从本机配置读取凭据，经 LangChain 客户端取得决策，再由引擎执行工具和记录事件。账本仍是隔离的本地模拟账本；脚本策略保留供测试和明确选择时使用。
 
 - 事件落盘到 SQLite，进程重启后 `replay` 出的视图与停止前完全一致。
 - 单次工具调用分三类结果：`SUCCEEDED` / `FAILED`（确定没生效）/ `UNCERTAIN`（不知道）。
@@ -16,18 +16,19 @@
 - `trace` 把事件渲染成时间线，也能导出 JSONL；观察者拿到的都是副本，改不动日志。
 - 模型策略把视图渲染成提示、把模型输出严格解析成 `ToolCall` / `Finish`；不联网，客户端由调用方注入。
 - 解析失败、模型超时、脚本写短一律 `PolicyError` → `RUN_FAILED`：一个工具都没调用，外部世界未变。
-- 提示只由视图与工具清单决定，重启后同一个视图得到同一份提示，续跑不再依赖重新提供脚本。
+- 提示只由视图与工具清单决定，重启后同一个视图得到同一份提示；模型模式续跑不需要脚本，脚本模式仍须提供原脚本。
 - 自动对账查不到记录时不再停在「不知道」，而是写 `REVIEW_REQUESTED` 进入 `WAITING_REVIEW`，等人工给结论。
 - 复核结论三种：`applied` 补记结果、`not_applied` 允许把调用当作新步骤重做、`abort` 终止任务（`ABORTED`）。
 - 等待复核期间引擎一步也不走：`resume` 只把状态带回来，不会替人猜。
 - 进程级故障矩阵：`after_decided`（决策已落盘）、`before_tool`（意图已落盘）、`after_tool`（副作用已发生）三个窗口都用 `os._exit` 真退进程，再用新进程恢复。
 - 只有决策、没有意图时复用已落盘的决策，不重新问策略——参数不会被换掉。
 - `STEP_UNCERTAIN` 不是终局：对账命中补记成功，查不到转人工，收敛之前 `resume` 一步不走。
-- 离线评测集覆盖 8 种结局，打印每次的停止原因、步数、事件数、余额与耗时。
+- 真实模型评测覆盖 8 个场景，打印停止原因、步数、事件数、余额、模型调用次数与耗时。
 - `RUN_FAILED` 的原因进入视图，`status` 直接打印「为什么失败」，不必再翻事件。
 - 提示里超长的参数与结果按 `field_limit`（默认 200 字）截断并标注截掉多少；截断是确定性的，同一视图仍渲染出同一份提示。
-- `HttpModelClient` 用标准库发 OpenAI 兼容请求：温度 0、不重试、超时即失败；错误信息不含密钥与提示。
-- 客户端只用本地 `http.server` 测过协议与坏响应；**没有真实服务凭据，真实兼容性未验证**。
+- `HttpModelClient` 通过 LangChain `ChatOpenAI` 发 OpenAI 兼容请求：配置温度 0，关闭自动重试、流式、Responses API 与缓存；错误信息不含密钥与提示。
+- `run` / `resume --policy model` 从本地配置与环境变量创建客户端；命令行仍兼容显式脚本模式。
+- 自动测试使用本地 HTTP 服务和隔离配置；真实服务联调与演示另外执行，不让 pytest 读取本机密钥。
 - 多 worker：`--owner` 启用租约，每次写事件带 `epoch` 栅栏；租约过期后可被接管，旧 worker 的写入被拒绝（`LOST`），任务状态不变。
 - 栅栏只保护日志：它不能阻止旧 worker 已经发出的工具调用，那部分仍靠对账与复核兜底。
 - `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
@@ -53,7 +54,14 @@ python -m venv .venv
 
 ## 命令行
 
-任务由 JSON 脚本描述，每项要么调用工具，要么结束：
+展示时使用模型策略，任务输入为自然语言：
+
+```powershell
+.\.venv\Scripts\python.exe -m agentrun.cli run --run-id demo-r1 --policy model `
+  --task "查询 alice 的余额，得到结果后结束" --max-steps 4
+```
+
+下面是保留的显式脚本模式，用于学习确定性动作和离线排障。它不调用模型。JSON 中每项要么调用工具，要么结束：
 
 ```json
 [
@@ -96,33 +104,80 @@ python -m venv .venv
 
 脚本是策略的一种：写短了不会抛栈，下一次决策会记 `RUN_FAILED`，退出码 1。
 
-## 模型策略（离线）
+## 模型策略与 LangChain 客户端
 
 `llm.py` 只定义适配器，不绑定任何模型服务：客户端只需实现 `complete(prompt) -> str`。
 
 ```python
 from agentrun.engine import Engine
 from agentrun.llm import ModelPolicy, ToolSpec
+from agentrun.model_client import client_from_env
 
+client = client_from_env()
 policy = ModelPolicy(client, [ToolSpec("get_balance", "读取账户余额")])
 result = Engine(policy, registry, log).run("r1", "查一下 alice 的余额", max_steps=5)
 ```
 
-接真实服务（未验证，谨慎使用）：
+安装依赖时，`pyproject.toml` 会安装 `langchain-openai`；不需要引入整个 LangChain Agent 框架。
+客户端仍提供 `complete(prompt) -> str`，工具调用、事件记录与恢复由本项目负责。
 
-```powershell
-$env:AGENTRUN_BASE_URL = "https://api.example.com/v1"
-$env:AGENTRUN_API_KEY = "sk-..."
-$env:AGENTRUN_MODEL = "your-model"
+项目根目录的 `agentrun.local.toml` 保存本机配置，已被 `.gitignore` 忽略。本机已配置好，不需要在每个终端重新输入密钥。新环境可将 `agentrun.example.toml` 复制为该文件，再填写自己的密钥：
+
+```toml
+[model]
+base_url = "https://api.deepseek.com"
+api_key = "填写自己的密钥"
+model = "deepseek-flash"
+timeout = 60.0
+reasoning_effort = "none"
 ```
 
-`client_from_env()` 会读取这三个变量；缺任何一个都直接报错，不会静默用空密钥发请求。
+模型名及地址依据 [DeepSeek 官方接入文档](https://api-docs.deepseek.com/quick_start/agent_integrations/)。`reasoning_effort = "none"` 用于关闭思考模式，缩短这些简单工具决策的等待时间，参见 [Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)。
 
-完整演示（假模型，不需要网络与密钥）：
+`client_from_env()` 按字段优先取环境变量，再取本地 TOML：`AGENTRUN_BASE_URL`、`AGENTRUN_API_KEY`、`AGENTRUN_MODEL`、`AGENTRUN_TIMEOUT`、`AGENTRUN_REASONING_EFFORT`。`AGENTRUN_CONFIG` 可指定另一份配置文件；默认路径按源码所在的项目根目录定位，不依赖当前终端目录。缺配置会明确失败，不会回退到假模型。
+
+命令行显式选择模型策略，不传 `--script`：
 
 ```powershell
+.\.venv\Scripts\python.exe -m agentrun.cli run --run-id model-r1 --policy model `
+  --task "查询 alice 的余额并说明结果" --max-steps 5
+
+.\.venv\Scripts\python.exe -m agentrun.cli resume --run-id model-r1 --policy model
+```
+
+模型模式创建任务时必须提供非空 `--task`；模型模式不能同时传 `--script`。
+默认脚本模式仍需 `--script`，原有命令不用修改。
+策略种类和模型配置不写入任务日志，续跑模型任务时须再次选择 `--policy model` 并保留本地配置或提供环境变量。
+`resume` 沿用日志中的任务描述、预算和已落盘决策；结果未知或等待复核时不会调用模型或重做工具。
+使用 `--owner` 启用租约时，`--lease-ttl` 应覆盖一次模型或工具调用的耗时并留出余量，
+例如请求超时 30 秒时可设置 `--lease-ttl 60`；当前没有后台续租线程。
+
+客户端只接收标准 Chat Completions 的非空字符串回答，不使用 SDK 原生工具执行或结构化输出。
+LangChain/服务对某些模型的温度参数可能有限制；相同提示也不保证模型每次回答相同。
+本地 HTTP 测试覆盖 LangChain 请求、坏响应、超时、零自动重试和错误脱敏。它们不请求付费模型；真实演示会联网，并按服务实际用量计费。
+
+## 真实模型展示
+
+在项目根目录运行，均自动读取本地配置：
+
+```powershell
+# 建议先看：真实模型选择工具、得到反馈，并展示中断后续跑
 .\.venv\Scripts\python.exe scripts\model_policy_demo.py
+
+# 再看：账本工具、持久化重放、对账、人工复核
+.\.venv\Scripts\python.exe scripts\ledger_demo.py
+.\.venv\Scripts\python.exe scripts\recovery_demo.py
+.\.venv\Scripts\python.exe scripts\reconcile_demo.py
+.\.venv\Scripts\python.exe scripts\review_demo.py
+
+# 崩溃窗口对比，以及 8 个真实模型评测场景
+.\.venv\Scripts\python.exe scripts\crash_window_demo.py
+.\.venv\Scripts\python.exe scripts\eval_suite.py
 ```
+
+每个展示打印实际模型请求次数，不会在网络失败时改用预设回答。模型得到历史步骤与工具说明，返回 JSON 动作；工具参数也来自模型回答。引擎负责校验、记录和执行。已经完成、正在等复核或结果未知的任务会按恢复规则停止，可能不需要新的模型请求。
+
+这里的真实部分是模型服务。余额和转账发生在隔离的模拟账本，崩溃与丢响应由演示代码明确注入；人工复核结论由演示者给出，不交给模型替人审批。`crash_window_demo.py` 先获得真实模型决策，再在三种存储设计中重放同一动作作对比，属于教学实验。
 
 ## 本地检查
 
@@ -131,12 +186,11 @@ $env:AGENTRUN_MODEL = "your-model"
 .\.venv\Scripts\ruff.exe check .
 .\.venv\Scripts\ruff.exe format --check .
 .\.venv\Scripts\python.exe -m mypy
-.\.venv\Scripts\python.exe scripts\eval_suite.py
 ```
 
-`eval_suite.py` 是离线评测集：8 个场景各跑一遍，逐行核对停止原因、状态、步数、事件数与余额。余额同时充当「重复副作用」的探针。
+`eval_suite.py` 是另外执行的联网展示评测。8 个场景核对任务状态、余额与调用次数；运行失败会返回非零退出码。模型输出存在变化，某次通过不代表所有输入均能成功。
 
-四者必须同时通过；CI 使用完全相同的入口。
+提交前运行上述离线检查；CI 运行 pytest、ruff 检查、格式检查与 mypy。真实模型演示按需单独运行，不接入自动 CI。
 
 ## 目录
 
@@ -145,6 +199,8 @@ src/agentrun/        包本体：账本、事件、折叠、编解码、工具�
 tests/               契约测试
 scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核、进程级故障注入、评测集
 .github/workflows/   CI 配置
+agentrun.example.toml  可提交的配置模板，不含真实凭据
+agentrun.local.toml    本机模型配置，被 Git 忽略
 PROJECT_LAYOUT.md    当前契约：目录、接口、决策、验证记录
 LEARNING_LOG.md      学习记录与复盘
 ```

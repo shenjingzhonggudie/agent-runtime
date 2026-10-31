@@ -1,16 +1,16 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-25（第 13 轮完成）
+> 最后更新：2026-10-30（DeepSeek 本地配置与真实模型展示接入）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
 | 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、离线评测集、CLI 六个子命令 |
-| 未实现能力 | 真实模型服务联调（无凭据）；跨机器时钟同步 |
-| 运行前提 | Windows + Python 3.14.6；全部离线，不依赖任何模型服务 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、CLI 六个子命令 |
+| 未实现能力 | 跨机器时钟同步；真实外部支付系统接入 |
+| 运行前提 | Python >= 3.14；运行依赖 `langchain-openai`；自动测试离线运行；展示脚本与 CLI 模型模式连接配置的真实服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 
@@ -20,6 +20,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 项目2/
 ├─ pyproject.toml            依赖与工具配置唯一来源（pytest / ruff / mypy）
 ├─ README.md                 环境准备与检查入口
+├─ agentrun.example.toml     可提交的配置模板
+├─ agentrun.local.toml       本机模型配置（Git 忽略，不含在仓库交付中）
 ├─ .gitignore
 ├─ .github/workflows/ci.yml  CI：安装 → lint → format → mypy → pytest
 ├─ scripts/
@@ -27,15 +29,16 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
 │  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
 │  ├─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
-│  ├─ model_policy_demo.py   模型策略：合法输出、解析失败、重启续跑（教学脚本，离线）
+│  ├─ model_policy_demo.py   真实模型策略：工具决策、重启续跑（联网展示）
 │  ├─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
+│  ├─ _live_demo.py         真实客户端、工具注册表与调用计数（展示共用）
 │  ├─ crash_runner.py        进程级故障注入：os._exit 在三个窗口退出（测试夹具）
 │  ├─ lease_worker.py        租约 worker：hold / takeover 两个模式（测试夹具）
 │  ├─ ledger_hammer.py       账本并发夹具：连做 N 次转账 / 占住账本锁（测试夹具）
 │  ├─ _probe_ledger_race.py  探针：两进程并发转账，核对成功次数与记账条数
 │  ├─ _probe_lock.py         探针：文件锁的跨进程互斥与进程被杀后自动释放
 │  ├─ _probe_journal_read.py 探针兼夹具：一边写一边读，统计完整性误报
-│  └─ eval_suite.py          离线评测集：8 种结局一张表
+│  └─ eval_suite.py          真实模型评测：8 个场景一张表
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -46,13 +49,14 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / JournalCorrupted / 两个实现（原子追加、租约栅栏、读侧验真）
 │  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
-│  ├─ model_client.py        ModelClientError / HttpModelClient / _extract_content / client_from_env
+│  ├─ model_client.py        ModelClientError / HttpModelClient（LangChain 适配）/ client_from_env
 │  ├─ engine.py              StopReason / EngineResult / NothingToResume / Engine（循环、预算、续跑）
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / NothingToResolve / pending_step / reconcile / resolve
 │  ├─ trace.py               TraceLine / summarize / timeline / export_jsonl（只读观察）
 │  └─ cli.py                 argparse 入口：run / resume / status / reconcile / resolve / trace
 └─ tests/
+   ├─ conftest.py               隔离本地模型配置，自动测试不读真实密钥
    ├─ test_package_smoke.py     包冒烟断言
    ├─ test_demo_ledger.py       账本：余额、三条拒绝规则、幂等回执、对账查询
    ├─ test_model_contract.py    事件折叠契约：顺序、seq、终态、结果唯一性
@@ -77,8 +81,9 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
    └─ test_cli.py               CLI：脚本解析、子命令退出码、状态与时间线输出
 ```
 
-**故意不存在**：真实模型客户端（HTTP、密钥、超时重试）。`llm.py` 只定义协议与解析，
-不 import 任何模型 SDK，因此全仓库仍然零运行时依赖。
+`llm.py` 只定义模型协议、提示渲染与动作解析，不 import 模型 SDK。
+具体模型通信由 `model_client.py` 中的 LangChain `ChatOpenAI` 适配实现，
+仍保留 `HttpModelClient` 公共构造参数与 `complete(prompt) -> str` 接口。
 
 ## 3. 已确认的公共接口
 
@@ -340,17 +345,21 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 | 子命令 | 关键参数 | 退出码 |
 |---|---|---|
-| `run` | `--run-id --script [--task] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或失联 / 2 参数、脚本或租约忙 |
-| `resume` | `--run-id --script [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
+| `run` | `--run-id [--policy {script,model}] [--script] [--task] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或失联 / 2 参数、脚本、配置或租约忙 |
+| `resume` | `--run-id [--policy {script,model}] [--script] [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
 | `status` | `--run-id` | 0 / 任务不存在时 2；额外打印租约持有者与剩余时间 |
 | `reconcile` | `--run-id` | 0 已补记或已提交复核 / 2 查询失败或无需对账 |
 | `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON]` | 0 已写入 / 2 没有待复核或参数错 |
 
 公共参数 `--db`（默认 `agentrun.db`）与 `--ledger`（默认 `ledger`）。
 
-CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume` 需要重新给一份
-同样的脚本。策略属于调用方，不属于日志。脚本写短时下一次决策抛 `PolicyError`，任务记
-`RUN_FAILED`（退出码 1），不再把异常栈抛给用户。
+CLI 默认装配 `ScriptedPolicy`，必须提供 `--script`；其续跑仍需同一份脚本。
+`--policy model` 装配 `ModelPolicy(client_from_env(), LEDGER_TOOL_SPECS)`，
+禁止同时提供 `--script`，创建任务须提供非空 `--task`。
+模型模式的 `resume` 不需要脚本，任务描述、预算与步骤取自日志。
+策略选择与模型配置不持久化，所以模型续跑仍须显式传入 `--policy model` 并保留本地配置或提供环境变量。
+缺配置时退出 2，不创建任务；模型调用或解析失败仍写 `RUN_FAILED` 并退出 1。
+等待对账或复核时继续遵守原恢复边界，不调用模型或重复执行工具。
 
 ### 3.11 时间线（`trace.py`）
 
@@ -409,23 +418,24 @@ CLI 只装配 `ScriptedPolicy`：它只依赖 `len(view.steps)`，所以 `resume
 
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `HttpModelClient(base_url, api_key, model, timeout=30)` | 地址、密钥、模型名、超时 | 客户端 | 实现 `ModelClient` 协议；`complete(prompt)` 返回文本 |
+| `HttpModelClient(base_url, api_key, model, timeout=30, reasoning_effort=None)` | 地址、密钥、模型名、超时 | 客户端 | 实现 `ModelClient` 协议；`complete(prompt)` 返回文本 |
 | `ModelClientError` | — | 异常 | 没拿到可用输出：网络、HTTP 非 2xx、非 JSON、结构不符、超时 |
-| `client_from_env()` | 环境变量 | 客户端 | 读 `AGENTRUN_BASE_URL` / `AGENTRUN_API_KEY` / `AGENTRUN_MODEL`（`AGENTRUN_TIMEOUT` 可选） |
+| `client_from_env()` | 环境变量与本地 TOML | 客户端 | 按字段环境变量优先；默认项目根 `agentrun.local.toml`，可用 `AGENTRUN_CONFIG` 指定；`timeout` / `reasoning_effort` 可选 |
 
-**请求形状**：`POST {base_url}/chat/completions`，头 `Authorization: Bearer <key>`，
-体 `{model, messages:[{role:"user", content: prompt}], temperature: 0}`。
+**实现**：使用 LangChain `ChatOpenAI`，显式配置 `max_retries=0`、
+`use_responses_api=False`、`streaming=False`、`cache=False`，沿用服务地址、密钥、模型名与超时。
+通过 Chat Completions 发送一条 user 消息，取回复消息的字符串 `content`。
 
 **不变量**：
 
 1. 不重试、不流式、不解析动作：一次调用只报告这一次的成败。
 2. 错误信息不含密钥与提示：它们会进入 `RUN_FAILED.reason` 与日志。
-3. 温度固定 0：服务端不保证确定性，但请求必须表达「尽量稳定」。
-4. 只要响应结构不合约（`choices[0].message.content` 不是非空字符串），一律
-   `ModelClientError`，不猜测、不取别的字段。
+3. 配置温度 0；SDK 或服务对部分模型的支持可能不同，相同提示不保证相同回答。
+4. LangChain 必须能解析标准 Chat Completions 响应；消息 `content` 不是非空字符串时，
+   一律 `ModelClientError`，不拼接多模态块、不猜测、不取别的字段。
+5. `AGENTRUN_TIMEOUT` 必须是有限的正数；错误不保留 SDK 可能含敏感数据的异常链。
 
-**验证边界**：测试只覆盖本地 `http.server`。没有真实服务凭据，兼容性（尤其
-`base_url` 是否要带 `/v1`、是否支持 `temperature`）未经真实联调。
+**验证边界**：自动测试使用本地 `http.server` 和临时配置，覆盖协议、配置优先级与错误脱敏；真实 DeepSeek 演示单独联网执行。真实联调结果只适用于本次服务和场景，不代替鉴权失败、限流及长上下文等专项验证。
 
 ## 4. 依赖方向
 
@@ -437,12 +447,12 @@ tools       → 无内部依赖                   （不认识 model / events / 
 journal     → events / codec              （分配 seq、落盘；不判断事件是否合法）
 policy      → model
 llm         → policy / model              （不认识工具实现、日志、引擎、HTTP）
-model_client→ 无（仅标准库）              （不认识 policy / model / 日志）
+model_client→ langchain_openai / pydantic （不认识 policy / model / 日志）
 engine      → policy / tools / journal / model / events
 ledger_tools→ demo / tools                （只做校验、一次账本调用、异常映射）
 reconcile   → journal / model / tools / events
 trace       → events / codec              （只读观察，不写日志、不判断合法性）
-cli         → engine / journal / policy / tools / reconcile / trace / ledger_tools / demo
+cli         → engine / journal / policy / llm / model_client / tools / reconcile / trace / ledger_tools / demo
 tests       → 全部
 scripts     → engine / policy / llm / journal / ledger_tools / reconcile / demo
 ```
@@ -460,7 +470,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D1 | 项目根目录 | `C:\Users\王佳浩\Desktop\项目2` | 2026-10-18 | 中文路径已实测可用 |
 | D2 | 包名 | `agentrun` | 2026-10-18 | 与参考项目同名，仓库路径隔离 |
 | D3 | 场景 | 模拟账本 alice→bob 250，阈值 500，储备线 300 | 2026-10-18 | 参数集中在 demo |
-| D4 | 运行时 | Python 3.14.6，业务仅标准库，开发依赖 pytest/ruff/mypy | 2026-10-18 | 不引 pydantic |
+| D4 | 初始运行时 | Python 3.14.6，业务仅标准库，开发依赖 pytest/ruff/mypy；模型依赖现由 D56 更新 | 2026-10-18 | 核心引擎仍不依赖模型框架 |
 | D5 | 版本控制 | 本地 git；最终完成时推 GitHub | 2026-10-18 | CI 仍无远端执行记录 |
 | D6 | 存储边界 | 账本与引擎日志分开存储 | 2026-10-18 | 保留跨系统崩溃窗口 |
 | D7 | 结果编码 | 三态 `SUCCEEDED/FAILED/UNCERTAIN`，失败详情放 `error` | 2026-10-19 | 加状态不改枚举 |
@@ -483,7 +493,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D24 | 连接策略 | 每次 `append` / `read` 新开连接，不持有长连接 | 2026-10-25 | 无状态，“重启”等于换实例；代价是每次多一次连接开销 |
 | D25 | 续跑预算 | 取日志里的 `view.max_steps`，不接收新参数 | 2026-10-25 | 预算属于任务；续跑时改预算等于事后改规则，日志里看不出来 |
 | D26 | 续跑已终结任务 | 返回现有视图 + 对应 `StopReason`，不抛异常、不追加事件 | 2026-10-25 | CLI 里“续跑一个早就成功的任务”是常见误操作，返回现状比栈信息有用 |
-| D27 | CLI 策略来源 | 读 JSON 脚本转成 `ScriptedPolicy`，用标准库 `argparse` | 2026-10-25 | 第 8 轮换模型策略时 CLI 不用动；不引 click，符合 D4 |
+| D27 | 初始 CLI 策略来源 | 读 JSON 脚本转成 `ScriptedPolicy`，用标准库 `argparse`；模型入口现由 D57 更新 | 2026-10-25 | 原脚本命令保持兼容 |
 | D28 | 观察者隔离方式 | `model.apply` 对 `args` 深拷贝，`TraceLine` 不携带 payload 引用 | 2026-10-25 | 浅拷贝挡不住嵌套改动；深拷贝的代价是每个 `STEP_DECIDED` 多一次复制 |
 | D29 | 校验失败的两种 kind | `invalid_args`（输入错）/ `validator_crashed`（工具自身 bug） | 2026-10-25 | 两者都归 FAILED（工具未执行），但只有后者需要改代码 |
 | D30 | 决策失败的落点 | `PolicyError` → `RUN_FAILED` + `StopReason.FAILED` | 2026-10-25 | 决策阶段零副作用，说“可能已生效”会毁掉 UNCERTAIN 的含义；代价是主循环多一个 `except` |
@@ -499,8 +509,8 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D40 | 只有决策、没有意图时的恢复 | 复用决策、补写意图并执行，不重新问策略 | 2026-10-25 | 工具一定没被调用过，重做安全；重新决策会换掉参数并留下两个决策。代价是引擎多一条「执行已有步骤」的路径 |
 | D41 | 失败原因的位置 | `RUN_FAILED.reason` 原文进入 `RunView.failure_reason` | 2026-10-25 | 只为让人一眼看到「为什么失败」；不解析、不分类，保持日志是唯一事实来源。代价是视图多一个字段 |
 | D42 | 提示截断策略 | 按字段截断（默认 200 字）并标注截掉多少，而不是整段提示一刀切 | 2026-10-25 | 整段截断会切掉工具清单与输出约定，模型反而更容易乱答；按字段截断保留结构，且确定性可测 |
-| D43 | HTTP 客户端边界 | 标准库、无重试、无流式、不解析动作、错误不含密钥与提示 | 2026-10-25 | 重试与解析属于外层；客户端只负责「这一次调用拿到了什么」。代价是超时/限流要由调用方兜底 |
-| D44 | 真实服务验证方式 | 只用本地 `http.server` 测协议，文档明写「未联真实服务」 | 2026-10-25 | 没有凭据就不假装验证过；把边界写清楚，比一个猜出来的兼容性结论有用 |
+| D43 | HTTP 客户端边界 | 无重试、无流式、不解析动作、错误不含密钥与提示；通信实现现由 D56 更新 | 2026-10-25 | 客户端只负责一次调用，超时与限流交给调用方处理 |
+| D44 | 初始服务验证方式 | 最初仅用本地 `http.server` 测协议；真实展示现由 D58 更新 | 2026-10-25 | 自动测试继续离线；联网验证单独记录 |
 | D45 | 租约放在哪一层 | 日志层（SQLite 行内字段），不放引擎内存或独立锁服务 | 2026-10-25 | 栅栏校验必须与 `seq` 分配在同一个事务里；放在别处就一定有「校验通过但写入已过期」的窗口 |
 | D46 | epoch 何时加一 | 只在接管时加一；同 owner 重取、续租都不变 | 2026-10-25 | 每次重启都加一会让 worker 把自己的旧写入判成非法；只在接管时加，才能精确表达「换人了」 |
 | D47 | 失联的表示 | `StopReason.LOST`，不改任务状态 | 2026-10-25 | 失联是 worker 的结局，不是任务的结局；任务仍 `RUNNING`，等接管者推进 |
@@ -512,6 +522,8 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D53 | 只读是否排队 | 排队：`balance` / `lookup` 也取锁 | 2026-10-25 | Windows 上 `os.replace` 与「别人正打开目标文件」冲突，实测会抛 `WinError 32`，而它会被 `run_tool` 归成 `UNCERTAIN`——把「确定没生效」抬成「可能已生效」。代价是读吞吐下降 |
 | D54 | 归还租约的时机 | `run` / `resume` 的 `finally`，任何结局都归还 | 2026-10-25 | 干净退出不该让下一个 worker 等满 TTL；放在 `finally` 才不会漏掉 `LOST` 与异常分支。代价是同一 owner 每次 run 都会换 epoch |
 | D55 | 过期租约怎么展示 | `status` 显示持有者与剩余时间；过期标「可被接管」，但**不自动接管** | 2026-10-25 | 运维需要「谁占着」这个事实；「过期」只说明此刻可以接管，不说明对方已经停下。系统不替人做接管决定 |
+| D56 | LangChain 通信适配 | `HttpModelClient` 内部改用 `ChatOpenAI`，保留公共构造参数、环境变量与纯文本接口 | 2026-10-30 | 增加 `langchain-openai` 依赖；关闭自动重试、Responses API、流式与缓存，保留错误脱敏 |
+| D57 | CLI 模型策略入口 | `run/resume --policy model` 创建模型客户端，默认仍为脚本策略 | 2026-10-30 | 模型续跑不需脚本，但须重新选择模式与提供模型配置；不改变事件格式和恢复边界 |
 
 ## 6. 工程检查
 
@@ -543,7 +555,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
   - GitHub Actions（ubuntu-latest + Python 3.14）→ 首次运行 `failure`（Type check：
     `demo.py` 里 `import fcntl` 上挂着多余的 `type: ignore`）；删掉忽略后第二轮
     `success`，310 个用例在 Linux 上全过，`fcntl.flock` 分支第一次被真实执行
-- 未验证：真实模型服务、跨机器时钟、`kill -9` 与断电、macOS
+- 未验证：跨机器时钟、`kill -9` 与断电、macOS
 
 ### 第 4 轮新增证据
 
@@ -576,11 +588,11 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
 | 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
 | 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
-| 真实模型服务从未联调 | 兼容性、鉴权、限流、上下文长度都只按文档推断 | 拿到凭据时 |
+| 真实服务验证范围有限 | 一次联调不能覆盖限流、上下文长度与所有模型输出 | 扩展服务和任务时 |
 | 客户端没有重试与退避 | 一次 429 或超时就让本次决策失败，任务记 `RUN_FAILED` | 接真实服务时 |
 | 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
 | 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
-| CLI 仍只装配脚本策略 | 通过命令行无法直接使用模型策略，要写装配代码 | 接真实模型服务时 |
+| 策略配置未持久化 | 模型续跑需再次传 `--policy model`；脚本续跑仍需原脚本 | 需要任务自动恢复或服务化时 |
 | 账本状态文件无格式版本号 | 改 `Record` 字段后旧文件不可读 | 第一次修改账本 schema |
 | 账本锁只被 Linux（CI）与 Windows（本机）验证过 | macOS 未跑；`fcntl` 在 Linux 上的语义与 macOS 也不完全一致 | 声称支持 macOS 时 |
 | 账本锁是整文件粒度 | 两个不同账户的转账也互相排队；写操作等锁上限 5s | 账户数或并发度上升时 |
@@ -593,5 +605,11 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 | 文件 | 计划职责 | 引入轮次 |
 |---|---|---|
-| `model_client.py` | 真实模型客户端：HTTP、密钥、超时与重试策略 | 决定接真实服务时 |
 | `lease.py` | owner、租约、心跳、epoch 与条件写入（日志 fencing） | v2：多 worker 接管 |
+
+### 2026-10-30：真实模型展示配置
+
+- D58：默认展示使用 `ModelPolicy` + `client_from_env()` 连接真实服务，无假模型回退。
+- D59：凭据仅保存在 Git 忽略的 `agentrun.local.toml`，模板与测试不含真实密钥；环境变量可逐字段覆盖。
+- 自动测试继续使用隔离配置与本地 HTTP 服务，进程级故障夹具保留确定性脚本策略。
+- 模拟账本、故障注入、人工复核与真实模型请求在演示输出中分别标明。

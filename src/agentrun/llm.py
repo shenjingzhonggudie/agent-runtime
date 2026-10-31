@@ -173,6 +173,10 @@ def parse_action(text: str) -> Action:
             映射、``finish`` 不是非空字符串。
 
     Notes:
+        这里的失败一律 ``retryable=True``：原因是「这一次的输出没读懂」，而模型下一
+        次可能就读懂了。它和「配置错了」不同——后者重试一百次也还是错。
+
+    Notes:
         解析是严格的，不做这几件事：
 
         1. 不剥 Markdown 代码块、不截取第一个 ``{`` 到最后一个 ``}``：容错会让「模型
@@ -181,42 +185,44 @@ def parse_action(text: str) -> Action:
         3. 不校验工具是否存在：那是引擎的事，只有注册表知道答案。
     """
     if not isinstance(text, str):
-        raise PolicyError(f"模型输出必须是字符串，收到 {type(text).__name__}")
+        raise PolicyError(f"模型输出必须是字符串，收到 {type(text).__name__}", retryable=True)
     raw = text.strip()
     if not raw:
-        raise PolicyError("模型输出为空")
+        raise PolicyError("模型输出为空", retryable=True)
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise PolicyError(f"模型输出不是合法 JSON：{exc.msg}：{_excerpt(raw)}") from exc
+        raise PolicyError(
+            f"模型输出不是合法 JSON：{exc.msg}：{_excerpt(raw)}", retryable=True
+        ) from exc
 
     if not isinstance(data, dict):
-        raise PolicyError(f"模型输出必须是 JSON 对象，收到 {type(data).__name__}")
+        raise PolicyError(f"模型输出必须是 JSON 对象，收到 {type(data).__name__}", retryable=True)
 
     if "tool" in data and "finish" in data:
-        raise PolicyError("模型输出不能同时给出 tool 与 finish")
+        raise PolicyError("模型输出不能同时给出 tool 与 finish", retryable=True)
     if "tool" not in data and "finish" not in data:
-        raise PolicyError("模型输出必须给出 tool 或 finish")
+        raise PolicyError("模型输出必须给出 tool 或 finish", retryable=True)
 
     # args 只在调用工具时合法；结束任务时多给 args 说明模型没读懂约定
     allowed = {"tool", "args"} if "tool" in data else {"finish"}
     unknown = sorted(set(data) - allowed)
     if unknown:
-        raise PolicyError(f"模型输出含未知字段：{unknown}")
+        raise PolicyError(f"模型输出含未知字段：{unknown}", retryable=True)
 
     if "tool" in data:
         tool = data["tool"]
         if not isinstance(tool, str) or not tool.strip():
-            raise PolicyError("模型输出的 tool 必须是非空字符串")
+            raise PolicyError("模型输出的 tool 必须是非空字符串", retryable=True)
         args = data.get("args", {})
         if not isinstance(args, Mapping):
-            raise PolicyError("模型输出的 args 必须是 JSON 对象")
+            raise PolicyError("模型输出的 args 必须是 JSON 对象", retryable=True)
         return ToolCall(tool, dict(args))
 
     answer = data["finish"]
     if not isinstance(answer, str) or not answer.strip():
-        raise PolicyError("模型输出的 finish 必须是非空字符串")
+        raise PolicyError("模型输出的 finish 必须是非空字符串", retryable=True)
     return Finish(answer)
 
 
@@ -263,10 +269,17 @@ class ModelPolicy:
             客户端异常不在这里分类：无论是超时还是鉴权失败，对引擎而言都只是「这次
             没拿到决策」，一律归为 ``PolicyError``，不写 ``UNCERTAIN``。后者意味着
             「可能已经改了」，与这里恰好相反。
+
+            ``retryable`` 由客户端给、这里只搬运：状态码在客户端手上，本层看不见，
+            重新分类等于凭异常文本猜。异常没有这个属性时按不可重试处理——不认识就
+            当确定性错误，比替它猜一个乐观答案更安全。
         """
         prompt = build_prompt(view, self._tools, field_limit=self._field_limit)
         try:
             text = self._client.complete(prompt)
         except Exception as exc:
-            raise PolicyError(f"模型调用失败：{exc}") from exc
+            raise PolicyError(
+                f"模型调用失败：{exc}",
+                retryable=bool(getattr(exc, "retryable", False)),
+            ) from exc
         return parse_action(text)

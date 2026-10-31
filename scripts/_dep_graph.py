@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,6 +142,97 @@ def cycles(edges: dict[str, set[str]]) -> list[tuple[str, ...]]:
     return found
 
 
+def reverse_edges(edges: dict[str, set[str]]) -> dict[str, set[str]]:
+    """计算反向依赖：每个模块被谁引用。
+
+    Args:
+        edges: 模块名 → 依赖集合。
+
+    Returns:
+        dict[str, set[str]]: 模块名 → 引用它的模块集合。
+    """
+    back: dict[str, set[str]] = {name: set() for name in edges}
+    for name, deps in edges.items():
+        for dep in deps:
+            back.setdefault(dep, set()).add(name)
+    return back
+
+
+def render_markdown() -> str:
+    """把依赖图渲染成一份可提交的文档。
+
+    Returns:
+        str: ``DEPENDENCIES.md`` 的全文。
+
+    Notes:
+        内容全部由 AST 现算，不含手写结论；重跑脚本即可刷新，避免文档与代码漂移。
+    """
+
+    def short(name: str) -> str:
+        """去掉包名前缀，只留模块名。"""
+        return name.removeprefix(PACKAGE + ".")
+
+    edges = collect()
+    back = reverse_edges(edges)
+    stdlib = set(sys.stdlib_module_names)
+    layer_names = [", ".join(short(item) for item in layer) for layer in layers(edges)]
+    found = cycles(edges)
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = project["project"].get("dependencies", [])
+    dependency_names = ", ".join(f"`{item}`" for item in dependencies) or "无"
+
+    lines = [
+        "# 依赖关系（自动生成）",
+        "",
+        "> 由 `scripts/_dep_graph.py --markdown` 从源码 AST 生成，不要手改。",
+        "> 重新生成：`.\\.venv\\Scripts\\python.exe scripts\\_dep_graph.py --markdown`",
+        "",
+        "## 概览",
+        "",
+        f"- 包内模块：{len(edges)} 个",
+        f"- 包内依赖边：{sum(len(deps) for deps in edges.values())} 条",
+        f"- 分层：{len(layer_names)} 层（自底向上）",
+        f"- 循环依赖：{len(found)} 个",
+        f"- 运行时直接依赖：{len(dependencies)} 个（来自 `pyproject.toml`）：{dependency_names}",
+        "",
+        "## 分层",
+        "",
+        "```",
+    ]
+    lines += [f"L{index}: {names}" for index, names in enumerate(layer_names, start=1)]
+    lines += ["```", "", "## 包内依赖（谁依赖谁）", "", "| 模块 | 依赖 |", "| --- | --- |"]
+    for name in sorted(edges):
+        deps = ", ".join(sorted(short(dep) for dep in edges[name])) or "—"
+        lines.append(f"| `{short(name)}` | {deps} |")
+
+    lines += ["", "## 反向依赖（谁引用它）", "", "| 模块 | 被谁引用 |", "| --- | --- |"]
+    for name in sorted(back):
+        users = ", ".join(sorted(short(item) for item in back[name])) or "—（无包内上游）"
+        lines.append(f"| `{short(name)}` | {users} |")
+
+    lines += ["", "## 外部依赖", "", "| 模块 | 标准库 / 第三方 |", "| --- | --- |"]
+    for path in sorted(PKG.glob("*.py")):
+        used = external_imports(path)
+        lines.append(f"| `{path.stem}` | {', '.join(sorted(used)) or '—'} |")
+    all_used = set().union(*(external_imports(path) for path in PKG.glob("*.py")))
+    third = sorted(all_used - stdlib)
+    lines += [
+        "",
+        f"标准库合计 {len(all_used & stdlib)} 个：{', '.join(sorted(all_used & stdlib))}",
+        "",
+        f"第三方合计 {len(third)} 个：{', '.join(third) or '无'}",
+    ]
+
+    for base in ("tests", "scripts"):
+        lines += ["", f"## {base}/", "", "| 文件 | 引用的包内模块 |", "| --- | --- |"]
+        for path in sorted((ROOT / base).glob("*.py")):
+            used = internal_imports(path, f"{PACKAGE}.{path.stem}")
+            names = ", ".join(sorted(short(item) for item in used)) or "—"
+            lines.append(f"| `{path.name}` | {names} |")
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     """打印依赖图、分层与环数量。
 
@@ -150,7 +242,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="同时打印 tests/ 与 scripts/ 的边")
     parser.add_argument("--external", action="store_true", help="打印标准库 / 第三方依赖")
+    parser.add_argument("--markdown", action="store_true", help="生成 DEPENDENCIES.md")
     args = parser.parse_args()
+
+    if args.markdown:
+        target = ROOT / "DEPENDENCIES.md"
+        target.write_text(render_markdown(), encoding="utf-8")
+        print(f"written: {target}")
 
     edges = collect()
     print("== 包内依赖边 ==")

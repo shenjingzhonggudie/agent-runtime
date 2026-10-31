@@ -3,8 +3,9 @@
 两个实现共用同一个 ``EventLog`` 协议：``MemoryEventLog`` 只用于测试与单进程场景，
 ``SqliteEventLog`` 负责跨进程持久化与租约。engine 不需要知道用的是哪一个。
 
-写入侧只保证三件事：序号连续、内容可解码、栅栏匹配。读取侧必须再验一次真——日志是
-恢复语义的唯一依据，缺一条事件就等于换了一个故事，不能"读到多少算多少"。
+写入侧只保证四件事：序号连续、内容可解码、栅栏匹配、同一个任务只启动一次。读取侧必须
+再验一次真——日志是恢复语义的唯一依据，缺一条事件就等于换了一个故事，不能"读到多少
+算多少"。
 
 依赖方向：
     engine → journal → events / codec
@@ -67,6 +68,36 @@ class JournalCorrupted(Exception):
     """
 
 
+class RunAlreadyStarted(Exception):
+    """同一个 ``run_id`` 已经有了开始事件，不能再启动一次。
+
+    抛出它表示**这次写入没有发生**：日志里仍然只有原来那条 ``RUN_STARTED``。新开一次
+    会让日志里出现两个起点，重放时无法判断哪一次才是真的开始——后果不是多一条记录，
+    而是整个任务的因果关系从此说不清。
+
+    Notes:
+        判据是「这个任务是否已经有事件」（``last_seq > 0``），**不是**「``runs`` 表里
+        有没有这一行」：``acquire`` 取租约时就会插入一条 ``last_seq = 0`` 的记录，此时
+        任务还没有开始。按「行存在」判断，会把一次合法的启动拦在门外。
+
+        检查必须与追加在同一个事务（``BEGIN IMMEDIATE``）里：先查后写分成两步，两个
+        进程就可能都查到 0，然后各写一条。
+    """
+
+
+class Conflict(Exception):
+    """写入者看到的版本已经过期：``last_seq`` 不再是它读到的那个值。
+
+    抛出它表示**这次写入没有发生**。它是乐观并发的正常失败，不是日志损坏，也不是
+    事件不合法：两个请求都读到同一份视图，先后写入时后者必然撞上它。
+
+    Notes:
+        与 ``LeaseLost`` 的区别在因果：``LeaseLost`` 是「你不该写」（身份失效，重试
+        无用）；``Conflict`` 是「你晚了一步」（事实变了，重读之后可能仍该写）。所以前
+        者该停手，后者该重读再判断。
+    """
+
+
 class EventLog(Protocol):
     """事件日志的最小接口：只能追加和读取，不能修改已写事件。
 
@@ -86,8 +117,31 @@ class EventLog(Protocol):
         payload: Mapping[str, Any],
         *,
         lease: Lease | None = None,
+        expect_seq: int | None = None,
     ) -> Event:
-        """追加一条事件并返回它（含日志分配的 ``seq``、``at``）。"""
+        """追加一条事件并返回它（含日志分配的 ``seq``、``at``）。
+
+        Args:
+            run_id: 任务标识。
+            type_: 事件类型。
+            payload: 事件字段。
+            lease: 可选的持有证明。
+            expect_seq: 可选的前置版本。给出时，只有当前 ``last_seq`` 等于它才写入；
+                ``0`` 表示「我认为这个任务还没有任何事件」。省略则不做版本检查。
+
+        Raises:
+            Conflict: ``expect_seq`` 与当前 ``last_seq`` 不符。
+            RunAlreadyStarted: 该任务已经有事件，却又写入 ``RUN_STARTED``。
+            LeaseLost: 该任务有活跃租约，而本次写入没有携带匹配的 owner 与 epoch。
+
+        Notes:
+            三条拒绝理由都必须与追加原子地发生：先读一遍再写一遍，两个写入者就可能
+            都通过检查。实现负责把「校验」放进与「写入」同一个临界区。
+
+            ``expect_seq`` 是**乐观并发**，不是悲观锁：它不阻止别人写，只保证「基于
+            我看见的那一版」这句承诺成立。调用方拿到 ``Conflict`` 后该重读再判断，
+            而不是盲目重试同一个 payload——重读之后，事实可能已经不允许这步操作。
+        """
         ...
 
     def read(self, run_id: str) -> tuple[Event, ...]:
@@ -139,6 +193,7 @@ class MemoryEventLog:
         payload: Mapping[str, Any],
         *,
         lease: Lease | None = None,
+        expect_seq: int | None = None,
     ) -> Event:
         """追加一条事件。
 
@@ -147,6 +202,7 @@ class MemoryEventLog:
             type_: 事件类型。
             payload: 事件字段，写入时做一次浅拷贝，避免调用方事后修改影响日志。
             lease: 可选的持有证明；日志里有活跃租约时必须匹配。
+            expect_seq: 可选的前置版本，见 ``EventLog.append``。
 
         Returns:
             Event: 已写入的事件，``seq`` 为该 run 内的下一条序号，``at`` 为当前
@@ -154,6 +210,8 @@ class MemoryEventLog:
 
         Raises:
             LeaseLost: 该 run 有活跃租约，而本次写入没有携带匹配的 owner 与 epoch。
+            Conflict: ``expect_seq`` 与当前 ``last_seq`` 不符。
+            RunAlreadyStarted: 该 run 已有事件，却又写入 ``RUN_STARTED``。
         """
         current = self._leases.get(run_id)
         if current is not None and (
@@ -162,6 +220,10 @@ class MemoryEventLog:
             raise LeaseLost(f"{run_id!r} 的租约属于 {current.owner}（epoch {current.epoch}）")
 
         seq = sum(1 for event in self._events if event.run_id == run_id) + 1
+        if expect_seq is not None and seq - 1 != expect_seq:
+            raise Conflict(f"{run_id!r} 的 last_seq 已是 {seq - 1}，期望 {expect_seq}")
+        if type_ == EventType.RUN_STARTED and seq > 1:
+            raise RunAlreadyStarted(f"任务 {run_id!r} 已经启动，不能重复写入 RUN_STARTED")
         event = Event(
             run_id=run_id,
             seq=seq,
@@ -344,6 +406,7 @@ class SqliteEventLog:
         payload: Mapping[str, Any],
         *,
         lease: Lease | None = None,
+        expect_seq: int | None = None,
     ) -> Event:
         """追加一条事件并返回它。
 
@@ -352,6 +415,7 @@ class SqliteEventLog:
             type_: 事件类型。
             payload: 事件字段，写入前做一次浅拷贝。
             lease: 可选的持有证明。
+            expect_seq: 可选的前置版本，见 ``EventLog.append``。
 
         Returns:
             Event: 已写入的事件，``seq`` 为该 run 的下一条序号，``at`` 为当前 UTC
@@ -360,6 +424,10 @@ class SqliteEventLog:
         Raises:
             LeaseLost: 该 run 有活跃租约，而本次写入没有携带匹配的 owner 与 epoch。
                 整条事务回滚，``last_seq`` 不变。
+            Conflict: ``expect_seq`` 与当前 ``last_seq`` 不符。整条事务回滚：这次
+                写入基于一份已经过期的视图，不能让它落地。
+            RunAlreadyStarted: 该任务已有事件，却又写入 ``RUN_STARTED``。同样整条
+                回滚：日志里不会留下第二条开始事件，``last_seq`` 也不动。
             EncodeError: ``payload`` 含有无法无损落盘的值。此时必须**整条回滚**：
                 不能留下 ``runs.last_seq`` 已经加过的痕迹，否则下一次正常写入会出现
                 序号缺口，恢复时会被误判为“丢了一条事件”。
@@ -373,6 +441,10 @@ class SqliteEventLog:
 
             租约校验与序号分配在**同一个事务**里：先校验租约再写，否则接管者与旧
             worker 可能各写一条，日志出现两个“下一步”。
+
+            「是否已启动」也在同一个事务里判断。把 SELECT 与 INSERT 拆到两个事务，
+            两个进程会同时读到 ``last_seq = 0``，然后各写一条 ``RUN_STARTED``——这种
+            重复在读取侧无法修复，重放时看到的只是两个都想当起点的故事。
         """
         conn = self._connect()
         try:
@@ -388,7 +460,16 @@ class SqliteEventLog:
                 ):
                     raise LeaseLost(f"{run_id!r} 的租约属于 {owner}（epoch {epoch}）")
 
-            seq = 1 if row is None else int(row[0]) + 1
+            last_seq = 0 if row is None else int(row[0])
+            if expect_seq is not None and last_seq != expect_seq:
+                raise Conflict(f"{run_id!r} 的 last_seq 已是 {last_seq}，期望 {expect_seq}")
+
+            # 已有事件才算「启动过」：acquire 会先插入一条 last_seq = 0 的空记录，
+            # 按「runs 里有没有这行」判断会把一次合法启动挡在门外。
+            if type_ == EventType.RUN_STARTED and last_seq > 0:
+                raise RunAlreadyStarted(f"任务 {run_id!r} 已经启动，不能重复写入 RUN_STARTED")
+
+            seq = last_seq + 1
             event = Event(
                 run_id=run_id,
                 seq=seq,

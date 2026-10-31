@@ -15,3 +15,6 @@ dist/
 *.sqlite3
 var/
 runs/
+
+# 本机模型凭据，不提交到版本控制
+agentrun.local.toml
