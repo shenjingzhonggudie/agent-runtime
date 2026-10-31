@@ -162,10 +162,13 @@ def render_markdown() -> str:
     """把依赖图渲染成一份可提交的文档。
 
     Returns:
-        str: ``DEPENDENCIES.md`` 的全文。
+        str: 依赖文档全文（Markdown）。
 
     Notes:
         内容全部由 AST 现算，不含手写结论；重跑脚本即可刷新，避免文档与代码漂移。
+
+        输出到终端而不是写进仓库：这是「随时可查」的派生信息，落盘就等于又建了一份
+        会过期的副本——正是第 19 轮要消掉的那种债务。
     """
 
     def short(name: str) -> str:
@@ -184,8 +187,8 @@ def render_markdown() -> str:
     lines = [
         "# 依赖关系（自动生成）",
         "",
-        "> 由 `scripts/_dep_graph.py --markdown` 从源码 AST 生成，不要手改。",
-        "> 重新生成：`.\\.venv\\Scripts\\python.exe scripts\\_dep_graph.py --markdown`",
+        "> 由 `scripts/_dep_graph.py --markdown` 从源码 AST 生成。",
+        "> 查看：`.\\.venv\\Scripts\\python.exe scripts\\_dep_graph.py --markdown`",
         "",
         "## 概览",
         "",
@@ -242,13 +245,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true", help="同时打印 tests/ 与 scripts/ 的边")
     parser.add_argument("--external", action="store_true", help="打印标准库 / 第三方依赖")
-    parser.add_argument("--markdown", action="store_true", help="生成 DEPENDENCIES.md")
+    parser.add_argument("--markdown", action="store_true", help="把依赖文档打印到终端")
     args = parser.parse_args()
 
     if args.markdown:
-        target = ROOT / "DEPENDENCIES.md"
-        target.write_text(render_markdown(), encoding="utf-8")
-        print(f"written: {target}")
+        print(render_markdown(), end="")
 
     edges = collect()
     print("== 包内依赖边 ==")

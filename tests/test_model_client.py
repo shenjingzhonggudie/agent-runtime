@@ -10,9 +10,11 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -49,7 +51,7 @@ class _Handler(BaseHTTPRequestHandler):
             time.sleep(0.4)
 
         status = 200
-        if mode in ("http429", "http500"):
+        if mode in ("http401", "http429", "http500"):
             status = int(mode.removeprefix("http"))
             # 服务错误可能回显请求正文和鉴权头；客户端异常不能把它们带出。
             raw = json.dumps(
@@ -59,6 +61,19 @@ class _Handler(BaseHTTPRequestHandler):
             raw = b"not-json"
         elif mode == "empty":
             raw = json.dumps({"choices": []}).encode()
+        elif mode == "missing":
+            # 有 choices、但没有 content：结构不完整，属于响应形状问题
+            raw = json.dumps(
+                {
+                    "id": "chatcmpl-local",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "offline-model",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant"}, "finish_reason": "stop"}
+                    ],
+                }
+            ).encode()
         else:
             content = (
                 123 if mode == "badcontent" else self.server.content  # type: ignore[attr-defined]
@@ -88,6 +103,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         """测试里不需要访问日志。"""
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """把默认配置文件指到一个不存在的路径。
+
+    Notes:
+        ``client_from_env`` 默认读项目根目录的 ``agentrun.local.toml``。开发机上这个
+        文件通常存在并指向真实服务；不隔离的话，「缺变量报错」与「默认超时 30 秒」
+        这两条断言会随机器而变——测试描述的是代码，不是开发者的本机配置。
+    """
+    monkeypatch.setattr(model_client, "DEFAULT_CONFIG_PATH", tmp_path / "absent.toml")
 
 
 @pytest.fixture()
@@ -148,13 +175,47 @@ def test_bad_responses_become_client_errors(server: Any, mode: str) -> None:
     assert len(server.seen) == 1
 
 
-def test_timeout_becomes_client_error(server: Any) -> None:
+def test_timeout_becomes_retryable_client_error(server: Any) -> None:
     server.mode = "timeout"
 
-    with pytest.raises(ModelClientError):
+    with pytest.raises(ModelClientError) as excinfo:
         client_for(server, timeout=0.1).complete("你好")
 
+    assert excinfo.value.retryable is True
     assert len(server.seen) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "retryable"),
+    [
+        ("http401", False),
+        ("http429", True),
+        ("http500", True),
+        ("garbage", False),
+        ("empty", False),
+        ("missing", True),
+        ("badcontent", False),
+    ],
+)
+def test_error_classification_decides_who_may_retry(
+    server: Any, mode: str, retryable: bool
+) -> None:
+    """错误映射表：这次失败值不值得再试一次。
+
+    Notes:
+        401 是确定性错误，重试一百次还是 401；429 与 5xx 是瞬时故障，退一步就能过去；
+        响应形状不对（非 JSON、结构缺字段）说明对端没有按协议说话，同样不该盲目重投。
+        分类只能发生在客户端——只有它看得见状态码与响应形状。
+    """
+    server.mode = mode
+
+    with pytest.raises(ModelClientError) as excinfo:
+        client_for(server).complete("你好")
+
+    assert excinfo.value.retryable is retryable, (
+        f"{mode}: 实际 retryable={excinfo.value.retryable}，"
+        f"cause={type(excinfo.value.__cause__).__name__}"
+    )
 
 
 def test_returns_original_plain_text_without_stripping(server: Any) -> None:
@@ -181,7 +242,6 @@ def test_constructs_nonstreaming_chat_model_without_retries_or_cache(
     class FakeChatModel:
         def __init__(self, **kwargs: Any) -> None:
             seen["options"] = kwargs
-            self.root_client = SimpleNamespace(close=lambda: seen.update(closed=True))
 
         def invoke(self, messages: Any) -> Any:
             seen["messages"] = messages
@@ -191,7 +251,14 @@ def test_constructs_nonstreaming_chat_model_without_retries_or_cache(
     client = HttpModelClient("https://example.invalid/v1/", "secret-token", "offline-model", 5)
 
     assert client.complete("private-prompt") == " untouched \n"
-    assert seen["options"] == {
+
+    options = dict(seen["options"])
+    # 连接由客户端自己持有：显式传进去而不是让 LangChain 用共享缓存；
+    # 调用结束后必须已经关闭，否则每次决策都漏一个 socket
+    http_client = options.pop("http_client")
+    assert isinstance(http_client, httpx.Client)
+    assert http_client.is_closed is True
+    assert options == {
         "model": "offline-model",
         "api_key": SecretStr("secret-token"),
         "base_url": "https://example.invalid/v1",
@@ -203,7 +270,6 @@ def test_constructs_nonstreaming_chat_model_without_retries_or_cache(
         "cache": False,
     }
     assert seen["messages"] == [("human", "private-prompt")]
-    assert seen["closed"] is True
     assert "secret-token" not in repr(client)
 
 
@@ -211,7 +277,7 @@ def test_constructs_nonstreaming_chat_model_without_retries_or_cache(
 def test_sdk_errors_do_not_leak_credentials_or_prompt(
     monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
-    closed: list[bool] = []
+    clients: list[httpx.Client] = []
 
     class BrokenResponse:
         @property
@@ -222,7 +288,7 @@ def test_sdk_errors_do_not_leak_credentials_or_prompt(
         def __init__(self, **kwargs: Any) -> None:
             if phase == "construct":
                 raise RuntimeError("secret-token private-prompt")
-            self.root_client = SimpleNamespace(close=lambda: closed.append(True))
+            clients.append(kwargs["http_client"])
 
         def invoke(self, messages: Any) -> Any:
             if phase == "invoke":
@@ -239,7 +305,11 @@ def test_sdk_errors_do_not_leak_credentials_or_prompt(
     rendered = "".join(traceback.format_exception(excinfo.value))
     assert "secret-token" not in rendered
     assert "private-prompt" not in rendered
-    assert closed == ([] if phase == "construct" else [True])
+    # 构造阶段就失败时模型对象还没建出来，连接由 with 负责关闭；其余阶段在这里核对
+    if phase == "construct":
+        assert clients == []
+    else:
+        assert all(item.is_closed for item in clients)
 
 
 def test_model_policy_accepts_http_client(server: Any) -> None:

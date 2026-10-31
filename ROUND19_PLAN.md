@@ -134,6 +134,33 @@
 | 4. 契约测试 | `test_model_client.py` 覆盖：请求体字段（`model`/`messages`/`temperature`）、401 / 429 / 5xx / 超时 / 非 JSON / 缺字段的错误映射、`SecretStr` 不进日志、`client_from_env` 缺变量报错 | 每个分支至少一条断言；错误信息里检索不到 key 与 prompt |
 | 5. 重试归属 | 记入 19D 的前置问题（客户端不重试是原则，还是 LangChain 默认行为已经带重试？） | 明确 LangChain 是否自带重试并把默认关掉或写进契约 |
 
+**完成记录（2026-10-31）**
+
+决策：
+
+- **D58 → 主依赖，不做 extras、不做惰性 import。** 产品形态是「一条命令能跑的东西」
+  （19I 的 `ask`），模型适配是主路径而不是可选插件。extras 加惰性 import 会引入第二个
+  安装矩阵，以及「装没装模型包」这个隐性状态；收益只是省几十 MB 磁盘。`pyproject.toml`
+  与 `PROJECT_LAYOUT.md` 第 13 行已按主依赖描述，口径一致。
+- **D59 → 保留 `HttpModelClient` 名字。** 公共构造参数（`base_url` / `api_key` /
+  `model` / `timeout` / `reasoning_effort`）与 `complete(prompt) -> str` 接口都没变，
+  改名会打断 CLI、脚本与文档的引用，收益只有「名字更准」。`PROJECT_LAYOUT.md` 第 86 行
+  已注明这一点，属于判据允许的「名不副实有明确解释」那一支。
+- **重试归属**：`ChatOpenAI` 显式配置 `max_retries=0`，契约测试断言了这一项。客户端
+  不重试，重试是引擎层的决定（19D2 的 `DECISION_FAILED`）。
+
+改动：
+
+- **收掉门禁里长期红的 6 条**：3 条是本机 `agentrun.local.toml` 没隔离（`client_from_env`
+  与 `cli run` 读到了真实配置），3 条是按旧实现写的断言（不传 `http_client`、关
+  `root_client`）。现有 **408 条全绿**。
+- **新增错误映射矩阵**：401 / 429 / 5xx / 超时 / 非 JSON / 缺 `content` / `content`
+  类型错，逐条断言 `retryable`。
+- **修掉一个真实缺陷**：LangChain 把底层网络异常包了一层，只对最外层做 `isinstance`
+  时超时被判成不可重试——这类误判不报警，只让本该自愈的抖动变成任务失败。改成沿
+  `__cause__` / `__context__` 找证据（`_causes`），超时与连接失败恢复为可重试。
+- `scripts/_dep_graph.py --markdown` 改为输出到终端，不再重建 `DEPENDENCIES.md`。
+
 ### 19I｜产品面入口（P1，把"引擎"变成"能用的东西"）
 
 问题：`agentrun run --policy model --task ...` 已能让 LLM 驱动工具，但缺"人的入口"，

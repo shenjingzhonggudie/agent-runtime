@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from agentrun import cli
+from agentrun import cli, model_client
 from agentrun.cli import load_actions, main
 from agentrun.events import EventType, make_step_key
 from agentrun.journal import SqliteEventLog
@@ -423,6 +423,8 @@ def test_model_missing_configuration_exits_2_without_creating_state(
 ) -> None:
     for name in ("AGENTRUN_BASE_URL", "AGENTRUN_API_KEY", "AGENTRUN_MODEL", "AGENTRUN_TIMEOUT"):
         monkeypatch.delenv(name, raising=False)
+    # 开发机上的 agentrun.local.toml 会提供一份可用配置，不隔离就测不到「缺配置」
+    monkeypatch.setattr(model_client, "DEFAULT_CONFIG_PATH", tmp_path / "absent.toml")
 
     code = main(
         [

@@ -15,10 +15,10 @@
 - 遇到 `UNCERTAIN` 引擎立即停止；对账查到已生效则补记结果，查不到则保持未知，绝不自动重做非幂等调用。
 - `trace` 把事件渲染成时间线，也能导出 JSONL；观察者拿到的都是副本，改不动日志。
 - 模型策略把视图渲染成提示、把模型输出严格解析成 `ToolCall` / `Finish`；不联网，客户端由调用方注入。
-- 解析失败、模型超时、脚本写短一律 `PolicyError` → `RUN_FAILED`：一个工具都没调用，外部世界未变。
+- 解析失败、模型超时、脚本写短一律 `PolicyError`：一个工具都没调用，外部世界未变。标了 `retryable` 的写 `DECISION_FAILED` 并暂停（任务仍是 `RUNNING`，可 `resume`），攒满 `MAX_DECISION_FAILURES` 或不可重试的才写 `RUN_FAILED`。
 - 提示只由视图与工具清单决定，重启后同一个视图得到同一份提示；模型模式续跑不需要脚本，脚本模式仍须提供原脚本。
 - 自动对账查不到记录时不再停在「不知道」，而是写 `REVIEW_REQUESTED` 进入 `WAITING_REVIEW`，等人工给结论。
-- 复核结论三种：`applied` 补记结果、`not_applied` 允许把调用当作新步骤重做、`abort` 终止任务（`ABORTED`）。
+- 复核结论三种：`applied` 补记结果、`not_applied` 允许把调用当作新步骤重做、`abort` 终止任务（`ABORTED`）。提交时带 `resolution_id`，同一个键重复提交只写一条结论，第二次按成功返回。
 - 等待复核期间引擎一步也不走：`resume` 只把状态带回来，不会替人猜。
 - 进程级故障矩阵：`after_decided`（决策已落盘）、`before_tool`（意图已落盘）、`after_tool`（副作用已发生）三个窗口都用 `os._exit` 真退进程，再用新进程恢复。
 - 只有决策、没有意图时复用已落盘的决策，不重新问策略——参数不会被换掉。
@@ -26,7 +26,7 @@
 - 真实模型评测覆盖 8 个场景，打印停止原因、步数、事件数、余额、模型调用次数与耗时。
 - `RUN_FAILED` 的原因进入视图，`status` 直接打印「为什么失败」，不必再翻事件。
 - 提示里超长的参数与结果按 `field_limit`（默认 200 字）截断并标注截掉多少；截断是确定性的，同一视图仍渲染出同一份提示。
-- `HttpModelClient` 通过 LangChain `ChatOpenAI` 发 OpenAI 兼容请求：配置温度 0，关闭自动重试、流式、Responses API 与缓存；错误信息不含密钥与提示。
+- `HttpModelClient` 通过 LangChain `ChatOpenAI` 发 OpenAI 兼容请求：配置温度 0，关闭自动重试、流式、Responses API 与缓存；错误信息不含密钥与提示。失败按状态码与响应形状标记 `retryable`（401 不重试，429 / 5xx / 超时重试），分类只在客户端做，引擎只读这个标记。
 - `run` / `resume --policy model` 从本地配置与环境变量创建客户端；命令行仍兼容显式脚本模式。
 - 自动测试使用本地 HTTP 服务和隔离配置；真实服务联调与演示另外执行，不让 pytest 读取本机密钥。
 - 多 worker：`--owner` 启用租约，每次写事件带 `epoch` 栅栏；租约过期后可被接管，旧 worker 的写入被拒绝（`LOST`），任务状态不变。
@@ -87,9 +87,10 @@ python -m venv .venv
 # 为「已开始、没有结果」的那一步补记结论；查不到则转入人工复核
 .\.venv\Scripts\python.exe -m agentrun.cli reconcile --run-id r1
 
-# 写下人工复核结论：applied / not_applied / abort
+# 写下人工复核结论：applied / not_applied / abort；--resolution-id 是幂等键
 .\.venv\Scripts\python.exe -m agentrun.cli resolve --run-id r1 --decision applied `
-  --note "账本记录与 step_key 一致" --result '{"found": true, "amount": 250}'
+  --note "账本记录与 step_key 一致" --result '{"found": true, "amount": 250}' `
+  --resolution-id review-0001
 
 # 打印时间线，或导出成一行一条的 JSONL
 .\.venv\Scripts\python.exe -m agentrun.cli trace --run-id r1
@@ -98,7 +99,7 @@ python -m venv .venv
 
 默认 `--db agentrun.db`、`--ledger ledger`，账本与事件日志必须分开存储（D6）。
 
-退出码：`0` 表示任务成功（或 `resolve` / `reconcile` 成功写入）；`1` 表示任务失败、预算耗尽或仍在等待复核；`2` 表示参数、脚本、日志或复核时机有问题。
+退出码：`0` 表示任务成功（或 `resolve` / `reconcile` 成功写入，含同一个 `resolution_id` 的重复提交）；`1` 表示任务失败、预算耗尽、决策失败待续跑或仍在等待复核；`2` 表示参数、脚本、日志或复核时机有问题。
 
 安装为命令后可直接用 `agentrun <子命令>`。
 

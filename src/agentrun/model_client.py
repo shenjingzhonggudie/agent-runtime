@@ -14,6 +14,7 @@
 import math
 import os
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,28 @@ def _status_code(error: BaseException) -> int | None:
     return None
 
 
+def _causes(error: BaseException) -> Iterator[BaseException]:
+    """沿异常链逐层给出异常，遇到环就停。
+
+    Args:
+        error: 最外层的异常。
+
+    Yields:
+        BaseException: 自身，以及它的 ``__cause__`` / ``__context__``，由外向内。
+
+    Notes:
+        SDK 会把底层网络异常包一层再抛出（``APITimeoutError`` 之类），只看最外层会
+        把超时误判成「未知错误」。链上的 ``__context__`` 也要走：本模块用 ``from None``
+        抛错是为了不把原文带进日志，但那不会斩断 ``__context__``，分类仍然需要它。
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
 def _is_retryable_error(error: BaseException) -> bool:
     """判断这次调用失败是否值得重试。
 
@@ -91,13 +114,18 @@ def _is_retryable_error(error: BaseException) -> bool:
     Notes:
         判据只有两条：异常种类与状态码，不看异常文本。文本不稳定，分类必须由可枚举
         的事实决定，否则同一类故障会在不同机器上得到不同结论。
+
+        沿异常链找证据：LangChain 与 openai SDK 抛的是自己的类型，真正的
+        ``httpx.TimeoutException`` 藏在 ``__cause__`` 里。只看最外层，超时会被判成
+        不可重试——这类误判不会报错，只会让本该自愈的一次抖动变成任务失败。
     """
-    if isinstance(error, (httpx.TransportError, TimeoutError, ConnectionError)):
-        return True
-    status = _status_code(error)
-    if status is None:
-        return False
-    return status >= 500 or status in RETRYABLE_STATUS
+    for item in _causes(error):
+        if isinstance(item, (httpx.TransportError, TimeoutError, ConnectionError)):
+            return True
+        status = _status_code(item)
+        if status is not None:
+            return status >= 500 or status in RETRYABLE_STATUS
+    return False
 
 
 @dataclass(frozen=True, slots=True)
