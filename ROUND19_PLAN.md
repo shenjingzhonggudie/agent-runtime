@@ -77,6 +77,23 @@
 **验收**：篡改任意一条事件（含同步改 `last_seq`）→ `verify` 报出**第一个**断点；
 未篡改 → 全链通过；老库迁移后行为不变。
 
+**完成记录（2026-10-31）**
+
+- `codec.SCHEMA_VERSION = 1`：记录顶层加 `schema`；缺失按 v1 读，老库不重写；高于
+  当前版本一律 `DecodeError`——按旧布局硬读会把字段读错，比直接拒绝危险得多。
+- `events` 表加 `prev_hash` / `hash` 两列，旧库走同一套 `PRAGMA table_info` +
+  `ALTER TABLE` 补列。摘要 = sha256(`run_id` + `seq` + `body` + `prev_hash`)，在追加
+  事务内计算，与序号分配同生共死。
+- `SqliteEventLog.verify_chain()` 返回 `ChainReport`（总数 / 已校验 / 第一个断点 /
+  原因）；三类断点：摘要不符、`prev_hash` 不符、链中间出现无摘要记录。
+- 新增第七个子命令 `agentrun verify [--run-id]`，默认校验全部任务，退出码 0 / 1 / 2。
+- **`read` 不做链校验**：它是审计动作，塞进读路径会让「读得慢」直接变成「恢复得慢」。
+- 迁移前的记录 `hash` 为 NULL，无法自证：校验从第一条带摘要的记录开始，CLI 分别输出
+  「全段无摘要」与「前段无法自证」两种措辞，既不算通过也不算篡改。
+- 用例：`tests/test_journal_chain.py`（12 条）+ `tests/test_codec.py` 补 schema 版本
+  矩阵。关键一条是「删中间一条 + 把后面那条重写成合法 `seq` + 改小 `last_seq`」——
+  `read` 会认为一切正常，只有链能抓到。
+
 ### 19C｜心跳（P1）
 
 现在只有「写前续租」，长工具调用期间不续租。改动：`Engine` 起一个后台心跳线程，

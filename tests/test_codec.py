@@ -45,10 +45,42 @@ class Opaque:
 
 def test_encode_output_is_json_object() -> None:
     raw = json.loads(encode_event(make_event()))
-    assert set(raw) == {"run_id", "seq", "type", "payload", "at"}
+    assert set(raw) == {"schema", "run_id", "seq", "type", "payload", "at"}
+    assert raw["schema"] == 1
     assert raw["type"] == "RUN_STARTED"
     assert raw["run_id"] == "run-1"
     assert raw["at"] == AT
+
+
+def test_records_without_schema_are_read_as_v1() -> None:
+    """加入这个字段之前写下的记录必须能原样读回，迁移不重写历史。"""
+    text = json.dumps(
+        {
+            "run_id": "run-1",
+            "seq": 1,
+            "type": "RUN_STARTED",
+            "payload": {"task": "转账", "max_steps": 1},
+            "at": AT,
+        }
+    )
+
+    event = decode_event(text)
+
+    assert event.type is EventType.RUN_STARTED
+    assert event.seq == 1
+
+
+@pytest.mark.parametrize("schema", [2, 99])
+def test_newer_schema_is_rejected(schema: int) -> None:
+    """不认识的版本必须拒绝：按旧布局硬读会把字段读错，比直接报错危险得多。"""
+    with pytest.raises(DecodeError, match="schema"):
+        decode_event(raw_json(schema=schema))
+
+
+@pytest.mark.parametrize("schema", [0, -1, "1", True, 1.5, None])
+def test_malformed_schema_is_rejected(schema: Any) -> None:
+    with pytest.raises(DecodeError, match="schema"):
+        decode_event(raw_json(schema=schema))
 
 
 def test_round_trip_basic() -> None:

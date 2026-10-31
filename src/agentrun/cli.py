@@ -1,6 +1,6 @@
 """命令行入口：把已有模块组装成可执行命令。
 
-六个子命令，各自只做一件事：
+七个子命令，各自只做一件事：
 
 - ``run``：从 JSON 脚本或模型决策跑一个新任务。
 - ``resume``：在已有日志上继续跑。
@@ -8,6 +8,7 @@
 - ``reconcile``：为悬空的那一步补记结论；查不到则提交人工复核。
 - ``resolve``：写下人工复核结论（applied / not_applied / abort）。
 - ``trace``：打印时间线，或把事件导出成 JSONL。
+- ``verify``：校验事件哈希链，报告第一个断点。
 
 默认装配 ``ScriptedPolicy``，保持原有脚本命令兼容；``--policy model`` 则从本地配置与环境变量
 构造客户端并装配 ``ModelPolicy``。脚本模式续跑仍需提供脚本；模型模式从日志中的任务
@@ -337,6 +338,41 @@ def cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """执行 ``verify`` 子命令：逐条重算摘要，指出第一个断点。
+
+    Args:
+        args: 解析后的命令行参数，含 ``run_id``（可空）与 ``db``。
+
+    Returns:
+        int: 0 表示全部完好；1 表示至少一条任务链有断点；2 表示日志里没有任务。
+
+    Notes:
+        默认校验全部任务：审计的用途是「我不知道哪里被动过」，要求调用方先报出
+        ``run_id`` 就把这个问题又推回给了人。
+    """
+    log = SqliteEventLog(args.db)
+    run_ids = (args.run_id,) if args.run_id else log.run_ids()
+    if not run_ids:
+        print("日志里没有任何任务")
+        return 2
+
+    broken = 0
+    for run_id in run_ids:
+        report = log.verify_chain(run_id)
+        if not report.ok:
+            broken += 1
+            print(f"{run_id}：断点在 seq {report.first_break} —— {report.reason}")
+            print(f"  已校验 {report.hashed}/{report.total} 条")
+        elif report.hashed == 0:
+            print(f"{run_id}：{report.total} 条事件全部是迁移前的记录，没有摘要，无法校验")
+        elif report.hashed < report.total:
+            print(f"{run_id}：{report.hashed}/{report.total} 条带摘要，链完好（前段无法自证）")
+        else:
+            print(f"{run_id}：{report.total} 条事件，链完好")
+    return 1 if broken else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器。"""
     parser = argparse.ArgumentParser(prog="agentrun", description="事件溯源执行引擎")
@@ -393,6 +429,11 @@ def build_parser() -> argparse.ArgumentParser:
     trace_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     trace_p.add_argument("--export", type=Path, default=None)
     trace_p.set_defaults(func=cmd_trace)
+
+    verify_p = sub.add_parser("verify", help="校验事件哈希链，报告第一个断点")
+    verify_p.add_argument("--run-id", default=None, help="只校验这个任务；省略则校验全部")
+    verify_p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    verify_p.set_defaults(func=cmd_verify)
 
     return parser
 

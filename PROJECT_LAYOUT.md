@@ -8,7 +8,7 @@
 | 项 | 状态 |
 |---|---|
 | 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、CLI 六个子命令 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、CLI 七个子命令 |
 | 未实现能力 | 跨机器时钟同步；真实外部支付系统接入 |
 | 运行前提 | Python >= 3.14；运行依赖 `langchain-openai`；自动测试离线运行；展示脚本与 CLI 模型模式连接配置的真实服务 |
 
@@ -46,7 +46,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ model.py               RunStatus / Outcome / ReviewView / InvalidEvent / StepView / RunView / apply / replay
 │  ├─ codec.py               CodecError / EncodeError / DecodeError / encode_event / decode_event
 │  ├─ tools.py               SideEffect / Tool 协议 / 异常 / ToolOutcome / ToolContext / ToolRegistry / run_tool
-│  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / JournalCorrupted / 两个实现（原子追加、租约栅栏、读侧验真）
+│  ├─ journal.py             EventLog 协议 / Lease / LeaseLost / LeaseBusy / JournalCorrupted / Conflict / RunAlreadyStarted / ChainReport / 两个实现（原子追加、租约栅栏、读侧验真、哈希链审计）
 │  ├─ policy.py              ToolCall / Finish / Action / PolicyError / Policy 协议 / ScriptedPolicy
 │  ├─ llm.py                 ToolSpec / ModelClient 协议 / build_prompt / parse_action / ModelPolicy
 │  ├─ model_client.py        ModelClientError / HttpModelClient（LangChain 适配）/ client_from_env
@@ -54,7 +54,7 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 │  ├─ ledger_tools.py        账本工具适配器：GetBalance / Transfer / SaveReceipt / LookupRequest
 │  ├─ reconcile.py           ReconcileResult / NothingToReconcile / NothingToResolve / pending_step / reconcile / resolve
 │  ├─ trace.py               TraceLine / summarize / timeline / export_jsonl（只读观察）
-│  └─ cli.py                 argparse 入口：run / resume / status / reconcile / resolve / trace
+│  └─ cli.py                 argparse 入口：run / resume / status / reconcile / resolve / trace / verify
 └─ tests/
    ├─ conftest.py               隔离本地模型配置，自动测试不读真实密钥
    ├─ test_package_smoke.py     包冒烟断言
@@ -225,6 +225,8 @@ payload 字段：`RUN_STARTED{task,max_steps}`、`STEP_DECIDED{step,tool,args,st
 | `LeaseBusy` | — | 异常 | 开始工作前就发现租约在别人手里 |
 | `lease_of(run_id)` | 任务标识 | `Lease \| None` | 只读快照：谁持有、何时到期；**不判断过期**，过期也会返回 |
 | `JournalCorrupted` | — | 异常 | 序列不自洽：缺号、`last_seq` 与实际条数不符、事件归属别的 `run_id`、有事件无元数据 |
+| `Conflict` | — | 异常 | `expect_seq` 与当前 `last_seq` 不符：这次写入基于一份过期的视图；该重读，不是重投 |
+| `RunAlreadyStarted` | — | 异常 | 同一 `run_id` 已有事件，却又要写 `RUN_STARTED`；判据是「有没有事件」，不是「`runs` 里有没有行」 |
 | `MemoryEventLog` | — | 实例 | 内存实现，仅用于测试与单进程 |
 | `SqliteEventLog(path)` | 数据库文件路径 | 实例 | 跨进程持久化与租约；构造时不连接、不建表 |
 
@@ -254,6 +256,15 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 3b. 这两次读取必须在**同一个只读事务**（`BEGIN … COMMIT`）里。`isolation_level=None`
    下每条语句各自成事务，写者可以在两次之间提交，于是"元数据旧、事件新"——把一次
    正常写入误报成损坏（探针实测 1500 次读误报 34 次；加事务后 0 次）。
+3c. **哈希链**：每条事件另存 `prev_hash`（上一条的摘要）与 `hash`（sha256 覆盖
+   `run_id` + `seq` + `body` + `prev_hash`）。`read` 不校验它——链校验是审计动作，由
+   `verify` 显式触发；塞进 `read` 会让「读得慢」直接变成「恢复得慢」。
+   它补的是 `last_seq` 的盲区：把中间一条删掉、把后面那条重写成合法 `seq`、再把
+   `last_seq` 一起改小，序列重新自洽，`read` 会认为一切正常——只有 `prev_hash` 还
+   指着一段已经不存在的内容。迁移前的记录 `hash` 为 NULL，无法自证：校验从第一条带
+   摘要的记录开始，并如实报告跳过了多少条，既不算通过也不算篡改。
+3d. 记录顶层带 `schema` 版本号（当前 1）；缺失视为 v1，老记录不重写。高于当前支持的
+   版本一律 `DecodeError`——按旧布局硬读会把字段读错，比直接拒绝危险得多。
 4. `sqlite3.connect(..., isolation_level=None)` 是硬要求：默认的隐式 BEGIN 是
    DEFERRED，两个连接会读到同一个 `last_seq`。
 5. **写栅栏**：`runs.owner` 非空时，`append` 必须携带 owner 与 epoch 都匹配的
@@ -349,7 +360,9 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 | `resume` | `--run-id [--policy {script,model}] [--script] [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
 | `status` | `--run-id` | 0 / 任务不存在时 2；额外打印租约持有者与剩余时间 |
 | `reconcile` | `--run-id` | 0 已补记或已提交复核 / 2 查询失败或无需对账 |
-| `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON]` | 0 已写入 / 2 没有待复核或参数错 |
+| `resolve` | `--run-id --decision {applied,not_applied,abort} --note [--result JSON] [--resolution-id]` | 0 已写入或同一键重复提交 / 2 没有待复核、已被处理或参数错 |
+| `trace` | `--run-id [--export PATH]` | 0 / 任务不存在时 2 |
+| `verify` | `[--run-id]` | 0 链完好 / 1 存在断点 / 2 日志里没有任务 |
 
 公共参数 `--db`（默认 `agentrun.db`）与 `--ledger`（默认 `ledger`）。
 
@@ -488,7 +501,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D19 | 编码载体 | `encode_event` 返回 `str`，不返回中间 `dict` | 2026-10-25 | 免掉“先编码成 dict、落盘时再 dumps”的第二层 |
 | D20 | 非 JSON 类型 | 一律 `EncodeError`，不用 `default=str` 兜底 | 2026-10-25 | `default=str` 会把 `Decimal("1.10")` 静默变成 `"1.10"`，重放时类型已变且无法发现 |
 | D21 | 编码模块位置 | 独立 `codec.py`，不并入 `events.py` | 2026-10-25 | `events.py` 保持零依赖纯契约；编解码需要 `json` 与递归校验 |
-| D22 | 表结构 | `runs(run_id, last_seq)` + `events(run_id, seq, body)` 两张表 | 2026-10-25 | 计数器是独立事实；`SELECT last_seq` + `UPDATE` 比 `MAX(seq)+1` 子查询更好排查，也不依赖 `RETURNING`（SQLite 3.35+） |
+| D22 | 表结构 | `runs(run_id, last_seq)` + `events(run_id, seq, body, prev_hash, hash)` 两张表 | 2026-10-25（2026-10-31 补链列） | 计数器是独立事实；`SELECT last_seq` + `UPDATE` 比 `MAX(seq)+1` 子查询更好排查，也不依赖 `RETURNING`（SQLite 3.35+） |
 | D23 | `body` 内容 | 存整条 `encode_event` 输出，同时保留 `seq` 列做主键与排序 | 2026-10-25 | `codec` 保持唯一格式来源；多一列换来 seq 一致性校验点 |
 | D24 | 连接策略 | 每次 `append` / `read` 新开连接，不持有长连接 | 2026-10-25 | 无状态，“重启”等于换实例；代价是每次多一次连接开销 |
 | D25 | 续跑预算 | 取日志里的 `view.max_steps`，不接收新参数 | 2026-10-25 | 预算属于任务；续跑时改预算等于事后改规则，日志里看不出来 |

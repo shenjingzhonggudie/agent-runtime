@@ -33,6 +33,7 @@
 - 栅栏只保护日志：它不能阻止旧 worker 已经发出的工具调用，那部分仍靠对账与复核兜底。
 - `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
 - 日志读侧验真：缺号、末尾被删、事件归属别的 `run_id` 一律抛 `JournalCorrupted`，不返回残缺序列；两次 SELECT 在同一个只读事务里，不会被并发写者插队。
+- 每条事件另存上一条的摘要，`verify` 重算全链并指出第一个断点：把中间一条删掉、把后面那条重写成合法 `seq`、再改小 `last_seq`，序列会重新自洽，`read` 看不出问题——只有链会指错。迁移前的记录没有摘要，`verify` 会如实说「这段无法自证」。
 - 账本所有公开方法都在 `ledger.lock` 的跨进程独占锁里完成读改写；拿不到锁抛 `LedgerBusy`（**确定未生效**），工具层映射成「业务拒绝」而不是「结果未知」。锁由内核持有，进程被杀即释放。
 - 一次 `run` / `resume` 结束时（成功、失败、耗尽、未知、失联都算）归还租约：干净退出的任务下一个 worker 立刻能接手，只有崩溃才等 TTL。`status` 会打印租约持有者与剩余时间，过期则标「可被接管」。
 
@@ -95,6 +96,9 @@ python -m venv .venv
 # 打印时间线，或导出成一行一条的 JSONL
 .\.venv\Scripts\python.exe -m agentrun.cli trace --run-id r1
 .\.venv\Scripts\python.exe -m agentrun.cli trace --run-id r1 --export trace.jsonl
+
+# 校验事件哈希链：删掉中间一条再改小 last_seq 也逃不掉
+.\.venv\Scripts\python.exe -m agentrun.cli verify --db agentrun.db
 ```
 
 默认 `--db agentrun.db`、`--ledger ledger`，账本与事件日志必须分开存储（D6）。

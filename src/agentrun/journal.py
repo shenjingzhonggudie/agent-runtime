@@ -11,6 +11,7 @@
     engine → journal → events / codec
 """
 
+import hashlib
 import sqlite3
 import time
 from collections.abc import Mapping
@@ -21,6 +22,56 @@ from typing import Any, Protocol
 
 from .codec import DecodeError, decode_event, encode_event
 from .events import Event, EventType
+
+
+def chain_hash(run_id: str, seq: int, body: str, prev_hash: str | None) -> str:
+    """算一条事件在链上的摘要。
+
+    Args:
+        run_id: 任务标识。
+        seq: 事件序号。
+        body: ``encode_event`` 的完整输出。
+        prev_hash: 上一条事件的摘要；链的起点为 ``None``。
+
+    Returns:
+        str: 十六进制 sha256。
+
+    Notes:
+        覆盖 ``run_id + seq + body + prev``，四样缺一不可：只算 ``body`` 时，把整条
+        记录搬到另一个任务名下仍能通过校验；不带 ``prev`` 时，删掉中间一条再把后面
+        的摘要全部重算，也没有任何东西能指出少了什么。
+
+        摘要不放进 ``body``，所以「往返无损」不受影响：链信息属于存储层，是记录的
+        封条，不是事件的内容。
+    """
+    digest = hashlib.sha256()
+    digest.update(f"{run_id}\n{seq}\n{prev_hash or ''}\n".encode())
+    digest.update(body.encode("utf-8"))
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ChainReport:
+    """一条任务事件链的审计结果。
+
+    Attributes:
+        run_id: 任务标识。
+        total: 事件总数。
+        hashed: 通过校验的事件数。迁移前写入的事件没有摘要，不计入。
+        first_break: 第一个断点的 ``seq``；整条链完好时为 ``None``。
+        reason: 断点原因；完好时为 ``None``。
+    """
+
+    run_id: str
+    total: int
+    hashed: int
+    first_break: int | None = None
+    reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """链是否完好。"""
+        return self.first_break is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,10 +416,11 @@ class SqliteEventLog:
             - ``runs(run_id TEXT PRIMARY KEY, last_seq INTEGER NOT NULL,
               owner TEXT, epoch INTEGER NOT NULL DEFAULT 0, lease_expires_at REAL)``
             - ``events(run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
-              PRIMARY KEY (run_id, seq))``
+              prev_hash TEXT, hash TEXT, PRIMARY KEY (run_id, seq))``
 
             旧库通过 ``PRAGMA table_info`` 判断缺哪列再 ``ALTER TABLE``，不重建表：
-            重建会丢掉事件，也可能把正在运行的任务变成孤儿。
+            重建会丢掉事件，也可能把正在运行的任务变成孤儿。补列之后旧事件的 ``hash``
+            为 NULL——迁移不给历史数据补封条，那等于替一段没人验证过的内容背书。
 
             ``body`` 存 ``encode_event`` 的完整输出。不要手工拼 JSON，也不要给
             ``json.dumps`` 传 ``default=str``：``codec`` 必须是唯一格式来源。
@@ -395,8 +447,15 @@ class SqliteEventLog:
             "run_id TEXT NOT NULL, "
             "seq INTEGER NOT NULL, "
             "body TEXT NOT NULL, "
+            "prev_hash TEXT, "
+            "hash TEXT, "
             "PRIMARY KEY (run_id, seq))"
         )
+        event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "prev_hash" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT")
+        if "hash" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN hash TEXT")
         return conn
 
     def append(
@@ -478,6 +537,14 @@ class SqliteEventLog:
                 at=datetime.now(UTC).isoformat(),
             )
             body = encode_event(event)
+            prev_hash: str | None = None
+            if last_seq > 0:
+                previous = conn.execute(
+                    "SELECT hash FROM events WHERE run_id = ? AND seq = ?",
+                    (run_id, last_seq),
+                ).fetchone()
+                prev_hash = None if previous is None else previous[0]
+            digest = chain_hash(run_id, seq, body, prev_hash)
             if row is None:
                 conn.execute(
                     "INSERT INTO runs (run_id, last_seq) VALUES (?, ?)",
@@ -486,8 +553,8 @@ class SqliteEventLog:
             else:
                 conn.execute("UPDATE runs SET last_seq = ? WHERE run_id = ?", (seq, run_id))
             conn.execute(
-                "INSERT INTO events (run_id, seq, body) VALUES (?, ?, ?)",
-                (run_id, seq, body),
+                "INSERT INTO events (run_id, seq, body, prev_hash, hash) VALUES (?, ?, ?, ?, ?)",
+                (run_id, seq, body, prev_hash, digest),
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -565,6 +632,87 @@ class SqliteEventLog:
                 f"{run_id!r} 的 last_seq 为 {last_seq}，实际只读到 {len(events)} 条事件"
             )
         return tuple(events)
+
+    def run_ids(self) -> tuple[str, ...]:
+        """列出日志里出现过的全部任务。
+
+        Returns:
+            tuple[str, ...]: 按字典序排列的 ``run_id``；空库返回空元组。
+
+        Notes:
+            从 ``runs`` 取而不是从 ``events``：``acquire`` 会先建一条 ``last_seq = 0``
+            的记录，那时任务还没有任何事件。审计要能看见「取了租约但一条都没写」的
+            任务——它本身就是一个需要被解释的状态。
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
+        finally:
+            conn.close()
+        return tuple(str(row[0]) for row in rows)
+
+    def verify_chain(self, run_id: str) -> ChainReport:
+        """校验一条任务的事件哈希链，报告第一个断点。
+
+        Args:
+            run_id: 任务标识。
+
+        Returns:
+            ChainReport: 总条数、通过校验的条数、第一个断点与原因。
+
+        Notes:
+            三类断点，对应三种破坏方式：
+
+            - 摘要与重算结果不符：这条 ``body`` 被改过；
+            - ``prev_hash`` 与上一条摘要不符：中间被删、被插或被换了顺序；
+            - 已经进入有摘要的段，又冒出无摘要记录：链中间插进了迁移前的数据。
+
+            迁移前写入的事件没有摘要，无法自证。校验从第一条带摘要的记录开始，并把
+            跳过了多少条如实报告——那既不算通过，也不算篡改，是两件不同的事。
+
+            不在 ``read`` 里做这件事：``read`` 每次恢复都要跑，链校验是审计动作，应当
+            由调用方显式触发。混在一起会让「读得慢」直接变成「恢复得慢」。
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT seq, body, prev_hash, hash FROM events WHERE run_id = ? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        expected_prev: str | None = None
+        started = False
+        hashed = 0
+        for seq, body, prev_hash, digest in rows:
+            if digest is None:
+                if started:
+                    return ChainReport(
+                        run_id,
+                        len(rows),
+                        hashed,
+                        int(seq),
+                        "链中间出现无摘要的事件，这段顺序无法确认",
+                    )
+                continue
+            if started and prev_hash != expected_prev:
+                return ChainReport(
+                    run_id,
+                    len(rows),
+                    hashed,
+                    int(seq),
+                    f"prev_hash 与上一条摘要不符（期望 {expected_prev!r}，实际 {prev_hash!r}）",
+                )
+            if chain_hash(run_id, int(seq), str(body), prev_hash) != digest:
+                return ChainReport(
+                    run_id, len(rows), hashed, int(seq), "摘要与内容不符，这条事件被改过"
+                )
+            started = True
+            expected_prev = str(digest)
+            hashed += 1
+
+        return ChainReport(run_id, len(rows), hashed)
 
     def lease_of(self, run_id: str) -> Lease | None:
         """返回当前登记的租约；无人持有返回 ``None``。

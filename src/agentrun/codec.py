@@ -5,6 +5,10 @@
 它不判断事件顺序（那是 ``model.apply`` 的职责），不分配 ``seq``（那是日志层的职责），
 不认识任何业务字段。唯一硬要求是往返无损：``decode_event(encode_event(e)) == e``。
 
+每条记录的顶层都带 ``schema`` 版本号。它回答的是「这条记录按哪一版的字段布局读」：
+同一份日志里可能同时存在不同版本写下的事件，解码必须按各自的版本解释，而不是按当前
+代码的假设。没有这个字段的老记录一律当 v1——迁移不重写历史，读侧也不改写历史。
+
 依赖方向：
     codec → events
 """
@@ -15,6 +19,14 @@ from collections.abc import Mapping
 from typing import Any
 
 from .events import Event, EventType
+
+SCHEMA_VERSION = 1
+"""当前写出的记录版本。
+
+它只增不减：旧版本必须永远能可靠读回来，否则「日志是唯一事实来源」这句话对已经落盘
+的记录就不成立了。新增字段不需要升版本（读侧忽略未知字段即可），只有改变已有字段的
+含义才需要——那种改动会让同一条记录在不同代码下读出两个意思。
+"""
 
 
 class CodecError(Exception):
@@ -113,8 +125,8 @@ def encode_event(event: Event) -> str:
         event: 待编码的事件。
 
     Returns:
-        str: JSON 文本，顶层对象的字段固定为 ``run_id`` / ``seq`` / ``type`` /
-        ``payload`` / ``at``，其中 ``type`` 使用枚举的字符串值。
+        str: JSON 文本，顶层对象的字段固定为 ``schema`` / ``run_id`` / ``seq`` /
+        ``type`` / ``payload`` / ``at``，其中 ``type`` 使用枚举的字符串值。
 
     Raises:
         EncodeError: 出现下列任一情况时抛出：
@@ -131,6 +143,7 @@ def encode_event(event: Event) -> str:
         raise EncodeError("payload 必须是映射")
     _check_value(event.payload, "payload")
     document = {
+        "schema": SCHEMA_VERSION,
         "run_id": event.run_id,
         "seq": event.seq,
         "type": event.type.value,
@@ -158,7 +171,8 @@ def decode_event(text: str) -> Event:
             ``text`` 不是 ``str``；不是合法 JSON；顶层不是对象；缺少
             ``run_id`` / ``seq`` / ``type`` / ``payload`` / ``at`` 任一字段；
             ``type`` 不是已知的 ``EventType``；``seq`` 不是 ``int``（``bool``
-            同样不接受）；``payload`` 不是对象；``run_id`` / ``at`` 不是 ``str``。
+            同样不接受）；``payload`` 不是对象；``run_id`` / ``at`` 不是 ``str``；
+            ``schema`` 不是正整数，或高于 ``SCHEMA_VERSION``。
 
     Notes:
         失败时抛异常，不返回「尽量拼出来的」事件。一条读不懂的记录如果被当成
@@ -172,6 +186,17 @@ def decode_event(text: str) -> Event:
         raise DecodeError(f"不是合法 JSON：{exc}") from exc
     if not isinstance(raw, dict):
         raise DecodeError("顶层必须是对象")
+
+    # 缺失视为 v1：加入这个字段之前写下的记录必须能原样读回，不能要求重写历史
+    schema = raw.get("schema", 1)
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise DecodeError(f"schema 必须是整数，收到 {type(schema).__name__}")
+    if schema < 1:
+        raise DecodeError(f"schema 必须是正整数，收到 {schema}")
+    if schema > SCHEMA_VERSION:
+        raise DecodeError(f"不认识的 schema 版本 {schema}：本版本最高支持 {SCHEMA_VERSION}")
+    # 当前只有 v1 一种布局；将来新增版本时在这里按 schema 分派到各自的解析器，
+    # 而不是把新字段塞进同一段线性判断里——那样两种版本会互相污染。
 
     run_id = _require(raw, "run_id", str)
     seq = _require(raw, "seq", int)
