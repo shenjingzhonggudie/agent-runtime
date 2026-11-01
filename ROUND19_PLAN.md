@@ -1,6 +1,7 @@
-# 第 19 轮计划（未开工，等「开」）
+# 第 19 轮：计划与完成记录
 
-> 状态：**仅记录，不动代码**。学习者说「开」之后才按批次实施。
+> 本轮已收尾。批次按落地顺序排列，每批都附完成记录与证据；19D、19F 改为后续版本计划，
+> 理由与触发条件见 `PROJECT_LAYOUT.md` §8。
 > 第 18 轮留空，未定义主题。
 
 ## 为什么这些放在同一轮
@@ -35,7 +36,7 @@
 - 探针改成回归测试：并发两次 `resolve` → 一条事件、第二次拿到 conflict 或 duplicate；
   日志 `replay` 始终成功
 - 现有 310 个用例不动
-- 决策追加：D56 写入前校验的位置、D57 幂等的键由谁给
+- 决策追加：D60 写入前校验的位置、D61 幂等的键由谁给
 
 **完成记录（2026-10-31）**
 
@@ -53,12 +54,12 @@
 
 决策：
 
-- **D56 → 写入前语义校验不放进 `append`。** 日志层只提供 `expect_seq`（比较并追加），
+- **D60 → 写入前语义校验不放进 `append`。** 日志层只提供 `expect_seq`（比较并追加），
   语义判断仍留在 `model.apply` / `reconcile`。两条理由：`events.py` 已声明「Event 只
   承载事实，合法性由 apply 判断」；把 `replay` 搬进日志层会让 `journal` 反向依赖
   `model`，并且 integrity 用例将无法构造坏日志（现有用例里就有一条缺 `step_key` 的
   `STEP_DECIDED`）。
-- **D57 → 幂等键由调用方给**（`resolution_id`）。只有调用方知道「同一次人工操作」的
+- **D61 → 幂等键由调用方给**（`resolution_id`）。只有调用方知道「同一次人工操作」的
   边界（请求 id、网关重试号）；引擎无法凭空生成一个跨进程稳定的键。
 
 ### 19B｜阶段 10：审计与版本边界（P0，可信度）
@@ -119,16 +120,26 @@
   语义正确，但要引入 daemon 线程与「没等到结果」的分类，且 Python 杀不掉线程）；
   给心跳设绝对上限（本质只是把租约时间调长，不解决问题）。两条都记进债务表。
 
-### 19D｜重试策略（P1，**需要先答一个架构问题**）
+### 19D｜进程内重试与退避（后续版本计划）
 
-现状：引擎与客户端都不重试（第 12 轮刻意决策）。任务书 §4 把「重试」列在故障语义里，
-目前只体现为"重试 = 新 attempt / 新 step_key"。
+现状：引擎与客户端都不重试（第 12 轮的决定）。故障语义里的「重试」目前只体现为
+「重试 = 新 attempt / 新 step_key」——引擎写 `DECISION_FAILED`、停下、等人 `resume`。
 
-待定问题（学习者先答）：重试放在客户端、`ModelPolicy`、引擎，还是更外层？
-对哪些失败可以重试（`ToolRejected` / `LedgerBusy` / 429 / 超时），各自凭什么判断
-"确定没生效"？
+这一版不做，原因不是难度，是判据还没定死：能重试的只有「确定未生效」的失败，而这条
+判据在不同层上的答案不一样。
 
-**验收**：只在"确定未生效"的失败上重试；重试次数与退避有上限；重试不产生第二条事件。
+- **模型调用**（`HttpModelClient` / `ModelPolicy`）：只读，重发安全。429 / 408 / 5xx /
+  连接失败 / 空回复都属于这一类，可以直接退避重发。
+- **工具调用**：`LedgerBusy` 确定没生效，可以重试；`ToolRejected`（余额不足）也确定没
+  生效，但重试结果一样，重试没有意义；`UNCERTAIN`（超时、未知异常）结果未知，**一步都
+  不能重**——`transfer` 是非幂等的，重试等于再转一次钱。
+
+落点在客户端还是引擎，取决于「重试要不要留痕」：留在客户端，事件日志看不见重试次数，
+审计只能看到这一步的耗时；留在引擎，就要回答它和已有的 `DECISION_FAILED` 是不是同一
+件事。验收条件已经写清，缺的是一个不自相矛盾的方案：
+
+**验收（下一版）**：只在「确定未生效」的失败上重试；重试次数与退避有上限；重试不产生
+第二条事件。
 
 ### 19E｜阶段 11 文档面（P2）
 
@@ -148,24 +159,24 @@
 - 两份文档都指向 `PROJECT_LAYOUT.md`（怎么做）与 `LEARNING_LOG.md`（怎么走到这儿的），
   同一件事不在三个地方各写一遍。
 
-### 19F｜真实模型联调（**阻塞：凭据**）
+### 19F｜真实模型联调（后续版本计划）
 
-需求方决定：**保留真实联调，不做降级**（2026-10-30）。
+保留真实联调，不做假模型降级（D58）。没有凭据就明确写「未联调」，不猜一个「应该兼容」。
 
-需要 `AGENTRUN_BASE_URL` / `AGENTRUN_API_KEY` / `AGENTRUN_MODEL` 三个环境变量。
-拿到后可补：真实成功样例、解析失败样例、429 样例，并改掉
-`model_client.py` 里那句「未联真实服务验证」。
+需要 `AGENTRUN_BASE_URL` / `AGENTRUN_API_KEY` / `AGENTRUN_MODEL` 三个环境变量。拿到后
+可补：真实成功样例、解析失败样例、429 样例，并去掉 `model_client.py` 里那句「未联真实
+服务验证」。
 
-备选（无凭据时）：本地 Ollama / llama.cpp 的 OpenAI 兼容端点，只能验证"真实输出
-守不守 JSON"，证明不了鉴权、配额与计费。
+不需要凭据的那部分已经做完：请求体精确断言、错误映射矩阵（401 / 429 / 5xx / 超时 /
+非 JSON / 缺字段）、`client_from_env` 缺变量报错，全部有测试兜底。
 
-无论走哪条，都要同时补齐不需要凭据的那部分：请求体精确断言、错误映射矩阵
-（401 / 429 / 5xx / 超时 / 非 JSON / 缺字段）、`client_from_env` 缺变量报错。
+无凭据时的备选是本地 Ollama / llama.cpp 的 OpenAI 兼容端点，但它只能证明「真实输出守
+不守 JSON」，证明不了鉴权、配额与计费——所以没有拿它充作联调。
 
 ### 19G｜Docker
 
-任务书允许不引入容器化。原计划建议不做：触发信号（CLI 稳定 + 跨机需求）都未成立。
-2026-11-01 需求方明确要求做，改为交付。
+容器化原本不在这一轮的计划里：触发信号（CLI 稳定 + 跨机需求）都还没成立。
+2026-11-01 决定做，于是改为交付项。
 
 **完成记录（2026-11-01）**
 
@@ -199,7 +210,7 @@
 - 仍未覆盖：只验证了 `linux/amd64`，没有 arm64 构建；镜像与 compose 都没有 `HEALTHCHECK`
   和资源限额。两条都进债务表。
 
-### 19H｜模型适配层收口（P1，学习者在 2026-10-30 加入 LangChain 之后必做）
+### 19H｜模型适配层收口（P1，接入 LangChain 之后必做）
 
 背景：`model_client.py` 已改成 `langchain_openai.ChatOpenAI` 实现，`pyproject.toml`
 新增 `langchain-openai>=1.0,<2` 与 `pydantic>=2.7.4,<3`。这推翻了「运行时零第三方
@@ -207,7 +218,7 @@
 
 | 改动 | 内容 | 判据 |
 |---|---|---|
-| 1. 文档口径 | `PROJECT_LAYOUT` / `README` 统一改成"核心 + 模型适配依赖"；删掉"零第三方"的旧话。**不再维护独立的依赖文档**（需求方 2026-10-30 删除 `DEPENDENCIES.md`），需要时用 `scripts/_dep_graph.py` 现场输出 | 两份文档口径一致，仓库里没有指向已删文件的链接 |
+| 1. 文档口径 | `PROJECT_LAYOUT` / `README` 统一改成"核心 + 模型适配依赖"；删掉"零第三方"的旧话。**不再维护独立的依赖文档**（2026-10-30 删掉 `DEPENDENCIES.md`，它只会和代码漂移），需要时用 `scripts/_dep_graph.py` 现场输出 | 两份文档口径一致，仓库里没有指向已删文件的链接 |
 | 2. 类名漂移 | `HttpModelClient` 已不是 HTTP 客户端。二选一：改名（`LangChainModelClient`）或在文档里注明"名字保留兼容" | 类名与职责一致，或"名不副实"有明确解释 |
 | 3. 依赖边界 | 决策：主依赖 vs extras（`[project.optional-dependencies].model`）+ 惰性 import | 决策编号入库；若选 extras，未装模型包时 `agentrun --help` 仍可用 |
 | 4. 契约测试 | `test_model_client.py` 覆盖：请求体字段（`model`/`messages`/`temperature`）、401 / 429 / 5xx / 超时 / 非 JSON / 缺字段的错误映射、`SecretStr` 不进日志、`client_from_env` 缺变量报错 | 每个分支至少一条断言；错误信息里检索不到 key 与 prompt |
@@ -217,11 +228,11 @@
 
 决策：
 
-- **D58 → 主依赖，不做 extras、不做惰性 import。** 产品形态是「一条命令能跑的东西」
+- **D62 → 主依赖，不做 extras、不做惰性 import。** 产品形态是「一条命令能跑的东西」
   （19I 的 `ask`），模型适配是主路径而不是可选插件。extras 加惰性 import 会引入第二个
   安装矩阵，以及「装没装模型包」这个隐性状态；收益只是省几十 MB 磁盘。`pyproject.toml`
   与 `PROJECT_LAYOUT.md` 第 13 行已按主依赖描述，口径一致。
-- **D59 → 保留 `HttpModelClient` 名字。** 公共构造参数（`base_url` / `api_key` /
+- **D63 → 保留 `HttpModelClient` 名字。** 公共构造参数（`base_url` / `api_key` /
   `model` / `timeout` / `reasoning_effort`）与 `complete(prompt) -> str` 接口都没变，
   改名会打断 CLI、脚本与文档的引用，收益只有「名字更准」。`PROJECT_LAYOUT.md` 第 86 行
   已注明这一点，属于判据允许的「名不副实有明确解释」那一支。
@@ -284,10 +295,10 @@ LangChain 改造与后续新增事件可能带入新 payload 字段。19B 的 sc
 
 ```
 19A（正确性，先做） → 19B（审计，含 19J 的新字段兼容）
-19H（模型适配收口，越早越好：它决定 19D 与文档口径）
-19C（心跳，独立）    19D（重试，需先回答放哪层）
+19H（模型适配收口，越早越好：它决定 D64 与文档口径）
+19C（心跳，独立）    19D（重试，留到下一版）
 19E（文档，可并行）   19I（产品入口，依赖 19H 的文档口径）
-19F 等凭据；19G 已交付（镜像实跑通过）
+19F（联调，留到下一版）；19G 已交付（镜像实跑通过）
 ```
 
 ## 不做什么
@@ -297,23 +308,23 @@ LangChain 改造与后续新增事件可能带入新 payload 字段。19B 的 sc
 - 不再新增第三方依赖：`langchain-openai` 与 `pydantic` 是既有决定，审计与锁仍用标准库
 - 不删证据脚本：只按 19I 分层目录，不改变它们证明的东西
 
-## 待决策清单（开工时逐条确认）
+## 决策清单（本轮全部定案）
 
-| 编号 | 待定 | 影响 |
-|---|---|---|
-| D56 | 写入前语义校验放在 `append` 还是 `reconcile` | 19A |
-| D57 | 幂等键由调用方给还是引擎生成 | 19A |
-| D58 | langchain 是主依赖还是 extras（配惰性 import） | 19H、19I |
-| D59 | `HttpModelClient` 改名还是保留 | 19H |
-| D60 | 重试放哪层、对哪些失败重试 | 19D |
+编号接着 `PROJECT_LAYOUT.md` §5 的序列往下排；D58 / D59 是 10-30 那批，已并入决策表。
 
-## 当前仓库状态（截至计划写下时）
+| 编号 | 待定 | 影响 | 结论 |
+|---|---|---|---|
+| D60 | 写入前语义校验放在 `append` 还是 `reconcile` | 19A | 不进 `append`，日志层只给 `expect_seq` |
+| D61 | 幂等键由调用方给还是引擎生成 | 19A | 调用方给 `resolution_id` |
+| D62 | langchain 是主依赖还是 extras（配惰性 import） | 19H、19I | 主依赖，不做 extras |
+| D63 | `HttpModelClient` 改名还是保留 | 19H | 保留原名，文档注明名不副实 |
+| D64 | 重试放哪层、对哪些失败重试 | 19D | 留到下一版；客户端 `max_retries=0` 这条先定下来 |
+
+## 收尾时的仓库状态（2026-11-01）
 
 ```
- M .gitignore             M pyproject.toml          M src/agentrun/cli.py
- M PROJECT_LAYOUT.md      M scripts/_dep_graph.py   M src/agentrun/model_client.py
- M README.md              M tests/test_cli.py       M tests/test_model_client.py
-?? ROUND19_PLAN.md        ?? scripts/_probe_double_resolve.py
---- HEAD: bc4fae1，main 与 origin/main 一致（未推送新改动）
---- 本地检查：pytest 341 passed / mypy 15 files 0 error / ruff 全绿
+--- 工作区干净，main 与 origin/main 一致
+--- 本地检查：pytest 439 passed / mypy 15 files 0 error / ruff 68 files 全绿
+--- CI：run 40189098128 success（ubuntu-latest + Python 3.14）
+--- Docker：镜像构建与容器内 ledger / run / verify 全部实跑通过
 ```

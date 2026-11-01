@@ -1,15 +1,16 @@
 # PROJECT_LAYOUT — 当前契约
 
 > 本文件只描述**已经存在**的东西。未来模块单列在末尾，不混入现状。
-> 最后更新：2026-10-30（DeepSeek 本地配置与真实模型展示接入）
+> 最后更新：2026-11-01（第 19 轮收尾：写入侧正确性、哈希链审计、心跳、产品入口与 Docker 交付）
 
 ## 1. 里程碑与当前状态
 
 | 项 | 状态 |
 |---|---|
-| 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、产品入口（ask / ledger）、CLI 九个子命令、Docker 运行镜像 |
-| 未实现能力 | 跨机器时钟同步；真实外部支付系统接入 |
+| 项目状态 | 第 19 轮收尾完成，不再新增功能。未开工的两批（19D 进程内重试、19F 真实模型联调）列入后续版本计划，理由与触发条件见 §8 |
+| 当前里程碑 | 第 19 轮完成：写入侧并发正确性、哈希链审计、心跳、产品入口、Docker 交付；本地四项检查与 CI 全绿 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、长调用期间的后台心跳续租、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、哈希链审计（`verify` 报告首个断点）、比较并追加（`expect_seq`）、复核幂等（`resolution_id`）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、产品入口（ask / ledger）、CLI 九个子命令、Docker 运行镜像 |
+| 未实现能力 | 进程内重试与退避（客户端显式 `max_retries=0`）；真实模型服务联调（缺凭据）；工具调用超时；跨机器时钟同步；真实外部支付系统接入 |
 | 运行前提 | Python >= 3.14；运行依赖 `langchain-openai`；自动测试离线运行；展示脚本与 CLI 模型模式连接配置的真实服务 |
 
 v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
@@ -19,7 +20,13 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ```text
 项目2/
 ├─ pyproject.toml            依赖与工具配置唯一来源（pytest / ruff / mypy）
-├─ README.md                 环境准备与检查入口
+├─ README.md                 产品入口：5 分钟跑一遍、能力与边界
+├─ docs/
+│  ├─ design.md              为什么这样设计：三个选择与各自的代价
+│  └─ scenarios.md           8 个真实模型场景的期望结局与证据链
+├─ PROJECT_LAYOUT.md         当前契约：接口、不变量、决策与债务
+├─ LEARNING_LOG.md           逐轮过程：踩了什么坑、怎么定位、留下什么债务
+├─ ROUND19_PLAN.md           第 19 轮的计划与完成记录
 ├─ agentrun.example.toml     可提交的配置模板
 ├─ agentrun.local.toml       本机模型配置（Git 忽略，不含在仓库交付中）
 ├─ .gitignore
@@ -495,7 +502,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 不得写日志、不得判断工具是否存在；`model_client` 不得 import `agentrun` 内任何模块，
 否则「协议」与「实现」会互相纠缠。
 
-## 5. 学习者已确认的决策
+## 5. 已确认的决策
 
 | # | 决策 | 结论 | 日期 | 代价 / 可逆性 |
 |---|---|---|---|---|
@@ -532,7 +539,6 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D31 | 模型输出解析 | 严格：不剥代码块、不截取花括号、不转类型 | 2026-10-25 | 容错会让“没按约定输出”变成“有时能跑”，日志里看不出差别；代价是真模型首次接入会在格式上失败几次 |
 | D32 | 工具是否存在的判定位置 | 仍由引擎判（`UnknownTool`），`llm` 不查注册表 | 2026-10-25 | 只有注册表知道答案；策略多查一次就会造出第二份“哪些工具可用”的事实 |
 | D33 | `ScriptExhausted` 的归属 | 继承 `PolicyError` | 2026-10-25 | 脚本用完与模型乱输出是同一类事：给不出动作。统一之后 CLI 由栈信息变成 `RUN_FAILED`（退出码 1） |
-| D34 | 分工变更 | 学习者只读，Agent 代行决策与全部实现；等待点 A/B/C 取消 | 2026-10-25 | 学习者明确要求「整个项目全部由你来完成，我最后会阅读全部内容」；代价是失去逐轮复盘的即时纠偏，改为文档留痕 |
 | D35 | 复核结论取值 | `applied` / `not_applied` / `abort` 三值，存字符串不建枚举 | 2026-10-25 | 事件 payload 里存字符串便于日志兼容；三值各有互斥的后续动作，多一个值就多一条状态分支 |
 | D36 | `WAITING_REVIEW` 的性质 | 暂停态，不是终态 | 2026-10-25 | 等人给结论之后任务还要继续；设成终态就必须再开一个 run，日志会断成两截 |
 | D37 | 自动对账查不到时的动作 | 追加 `REVIEW_REQUESTED` 进入复核 | 2026-10-25 | 第 6 轮是「不写」，把不知道留在原地；现在自动手段用尽，把它升级成「需要人」才是闭环。代价是每次查不到都会产生一条待办 |
@@ -556,14 +562,21 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | D55 | 过期租约怎么展示 | `status` 显示持有者与剩余时间；过期标「可被接管」，但**不自动接管** | 2026-10-25 | 运维需要「谁占着」这个事实；「过期」只说明此刻可以接管，不说明对方已经停下。系统不替人做接管决定 |
 | D56 | LangChain 通信适配 | `HttpModelClient` 内部改用 `ChatOpenAI`，保留公共构造参数、环境变量与纯文本接口 | 2026-10-30 | 增加 `langchain-openai` 依赖；关闭自动重试、Responses API、流式与缓存，保留错误脱敏 |
 | D57 | CLI 模型策略入口 | `run/resume --policy model` 创建模型客户端，默认仍为脚本策略 | 2026-10-30 | 模型续跑不需脚本，但须重新选择模式与提供模型配置；不改变事件格式和恢复边界 |
+| D58 | 真实模型展示的默认装配 | 默认展示用 `ModelPolicy` + `client_from_env()` 连接真实服务，无假模型回退 | 2026-10-30 | 假模型会让「跑通」变成演示层面的假象；代价是展示必须有可用凭据 |
+| D59 | 凭据的存放位置 | 只放 Git 忽略的 `agentrun.local.toml`；模板与测试不含真实密钥，环境变量可逐字段覆盖 | 2026-10-30 | 密钥一旦进仓库历史就擦不掉；代价是每台机器要各自配置 |
+| D60 | 写入前语义校验的位置 | 不放进 `append`；日志层只提供 `expect_seq`（比较并追加），语义判断留在 `model.apply` / `reconcile` | 2026-10-31 | 把 `replay` 搬进日志层会让 `journal` 反向依赖 `model`，integrity 用例也将无法构造坏日志。代价是语义矛盾仍要到读侧才暴露 |
+| D61 | 复核幂等键的来源 | 调用方给 `resolution_id`；同 id 第二次不写事件，返回首次结果 + `duplicate` | 2026-10-31 | 只有调用方知道「同一次人工操作」的边界（请求 id、网关重试号）；引擎无法凭空生成跨进程稳定的键 |
+| D62 | LangChain 是主依赖还是 extras | 主依赖，不做惰性 import | 2026-10-31 | 「一条命令能跑」意味着模型适配是主路径；extras 会引出第二个安装矩阵与「装没装」这个隐性状态。代价是安装体积 |
+| D63 | `HttpModelClient` 是否改名 | 保留原名，在 §3 注明名不副实 | 2026-10-31 | 构造参数与 `complete(prompt) -> str` 都没变；改名只打断 CLI、脚本与文档的引用，收益仅是名字更准 |
+| D64 | 重试放哪层 | 客户端显式 `max_retries=0`（契约测试断言）；重试只在引擎层体现为 `DECISION_FAILED` + `resume` | 2026-10-31 | 模型调用是只读的，重试安全；工具调用要看幂等性，`transfer` 一步都不能重。代价是一次 429 就要停一轮等人 |
 
 ## 6. 工程检查
 
 | 工具 | 范围 | 命令 | 当前状态 |
 |---|---|---|---|
-| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 310 passed |
+| pytest | `tests/` | `.\.venv\Scripts\python.exe -m pytest` | 实测 439 passed |
 | ruff lint | 全仓库 | `.\.venv\Scripts\ruff.exe check .` | 通过 |
-| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
+| ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（68 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，ubuntu-latest + Python 3.14 | 同上四条 | **已推送并实跑通过**（run 40189098128） |
 | Docker | `Dockerfile` + `docker-compose.yml`，数据在命名卷 | `docker build` / `docker compose build` / 容器内 `ledger` + `run --policy script` + `verify` | **已实跑通过**（Docker Desktop 4.97.0，Engine 29.9.2，linux/amd64）：非 root `uid=10001`、`/data` 可写、命名卷跨容器持久化、任务 `SUCCEEDED`、`verify` 链完好 |
@@ -573,21 +586,30 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 
 ## 7. 最近一次实际验证
 
-- 时间：2026-10-25（第 17 轮完成：远端仓库 + CI 实跑）
+- 时间：2026-11-01（第 19 轮收尾）
 - 命令与结果：
-  - `pytest` → `310 passed`（新增 8 例：归还后的接手、UNCERTAIN 也归还、被接管不越权、
-    归还失败不改结局、归还后禁写、`lease_of`、`status` 两态输出）
+  - `pytest` → `439 passed in 72.25s`
   - `ruff check .` → `All checks passed!`
-  - `ruff format --check .` → `54 files already formatted`
+  - `ruff format --check .` → `68 files already formatted`
   - `mypy` → `Success: no issues found in 15 source files`
-  - 修前证据：新增用例里 `test_finished_run_gives_the_lease_back` 与
-    `test_uncertain_stop_gives_the_lease_back` 报 `assert None is not None`——任务已结束，
-    另一个 owner 仍拿不到租约，必须等满 TTL
-  - `python scripts/eval_suite.py` → `8/8 通过`
-  - GitHub Actions（ubuntu-latest + Python 3.14）→ 首次运行 `failure`（Type check：
-    `demo.py` 里 `import fcntl` 上挂着多余的 `type: ignore`）；删掉忽略后第二轮
-    `success`，310 个用例在 Linux 上全过，`fcntl.flock` 分支第一次被真实执行
-- 未验证：跨机器时钟、`kill -9` 与断电、macOS
+  - Docker：`docker build` 与 `docker compose build` 均成功；容器内 `--help` 列出九个子
+    命令、`id` 为 `uid=10001(app)`、`/data` 可写；命名卷里 `ledger init --A=1000 --B=0`
+    后换容器仍读到 `A: 1000 / B: 0`；`run --policy script` 跑通两步任务（`SUCCEEDED`）；
+    `verify` 报「8 条事件，链完好」；compose 传入空 `AGENTRUN_*` 时 `ask` 报配置缺失并退出 2
+  - GitHub Actions（ubuntu-latest + Python 3.14）→ run `40189098128` `success`
+- 未验证：真实模型服务（缺凭据）、`kill -9` 与断电、macOS、arm64 镜像
+
+### 2026-10-25 那次验证（第 17 轮）
+
+- `pytest` → `310 passed`（新增 8 例：归还后的接手、UNCERTAIN 也归还、被接管不越权、
+  归还失败不改结局、归还后禁写、`lease_of`、`status` 两态输出）
+- `ruff format --check .` → `54 files already formatted`
+- `python scripts/eval_suite.py` → `8/8 通过`
+- 修前证据：新增用例里 `test_finished_run_gives_the_lease_back` 与
+  `test_uncertain_stop_gives_the_lease_back` 报 `assert None is not None`——任务已结束，
+  另一个 owner 仍拿不到租约，必须等满 TTL
+- GitHub Actions 首次运行 `failure`（Type check：`demo.py` 里 `import fcntl` 上挂着多余的
+  `type: ignore`）；删掉忽略后第二轮 `success`，`fcntl.flock` 分支第一次被真实执行
 
 ### 第 4 轮新增证据
 
@@ -603,16 +625,21 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 2026-10-18：本机 pip 全局索引指向清华镜像，TLS 握手失败（`SSLEOFError`）；官方 PyPI 可用。
 未修改全局 pip 配置，仅在安装命令中显式指定索引。
 
-## 8. 当前债务
+## 8. 债务与后续版本计划
+
+每一条都是当前真实存在的边界。标了「后续版本计划」的三批不是遗漏，是权衡之后明确
+留到下一版的决定；其余是已知的实现上界。
 
 | 债务 | 影响 | 触发信号 |
 |---|---|---|
-| `RUN_FAILED` 的 reason 未进视图 | CLI 显示失败原因需回读事件 | 需要结构化失败原因时 |
+| **后续版本计划**：真实模型服务联调（19F） | 错误映射矩阵、请求体断言、缺变量报错都有测试兜底；但鉴权、配额、计费只有真实服务能证明。当前缺 `AGENTRUN_BASE_URL` / `API_KEY` / `MODEL` 凭据 | 拿到可用凭据时 |
+| **后续版本计划**：进程内重试与退避（19D） | 一次 429 或超时只写 `DECISION_FAILED` 并暂停，要人 `resume` 才继续。模型调用重试是安全的（只读），工具调用要看幂等性——`transfer` 一步都不能重，这是这条一直没做的原因 | 需要无人值守跑长任务时 |
+| **后续版本计划**：工具调用超时 | 工具卡在死循环或永不返回的等待上时，心跳照常续租，租约不会过期，别人也接不了手，只能靠人杀进程加 TTL 兜底。加超时会引入「没等到结果」这个新分类 | 出现无人值守的长任务时 |
 | 完整性证据只覆盖迁移后的记录 | 哈希链能抓住删、改、插入与换序，但迁移前的旧事件 `hash` 为 NULL，无法自证；另外它只防「改内容」，不防「整份库被换成另一份自洽的库」（没有外部锚点） | 需要对外举证历史记录时 |
 | `read` 每次做全量扫描 | 连续性检查与 `last_seq` 对账都要遍历全部事件；engine 每步 `_view` 都读一遍 | 单任务事件到万条、或需要高频查看时 |
 | `trace` 只能一次性读取 | 没有“边跑边看”的实时通道，只能事后 `timeline` 或导出 | 需要实时观察长任务时 |
-| `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 第 6 轮对账工具 |
-| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码 | 第 7 轮写入前的最后校验 |
+| `lookup` 不区分记录类型 | 同一 id 先后写过 transfer 与 receipt 时只能返回先写入者 | 同一请求号既转账又留回执、且需要分别取回时 |
+| `codec` 不校验 payload 的业务字段 | 形状合法但语义不全的事件能通过编码；语义矛盾要到 `model.apply` 才暴露（D60 决定不把校验前移到日志层） | 需要「写入即拒绝」而不是「读到才报错」时 |
 | 栅栏只保护日志，不保护副作用 | 旧 worker 的工具调用可能已经发出；日志拒写不等于外部世界没变 | 永久边界，靠对账与复核兜底 |
 | 租约 TTL 依赖本机时钟 | 没有时钟漂移校正；跨机器部署时 `expires_at` 不可比 | 跨机器多 worker 时 |
 | 进程级故障只模拟 `os._exit` | 不等于 `kill -9`、断电或 fsync 丢失；存储层语义未验证 | 需要真机断电 / 容器 kill 时 |
@@ -620,8 +647,6 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 复核依据只是自由文本 | `note` 写「已核对」也照样落盘，系统无法判断证据真伪 | 需要审计或合规举证时 |
 | 复核没有升级与超时策略 | 任务可能无限停在 `WAITING_REVIEW`，没有人被提醒 | 接入多人运维或多任务调度时 |
 | 复核请求不会自动重试对账 | 外部系统延迟写入时，查不到就直接进人工，没有「稍后再查」的路径 | 出现延迟到账 / 最终一致的外部系统时 |
-| 真实服务验证范围有限 | 一次联调不能覆盖限流、上下文长度与所有模型输出 | 扩展服务和任务时 |
-| 客户端没有重试与退避 | 一次 429 或超时只写 `DECISION_FAILED` 并暂停，要人 `resume` 才继续；引擎层没有自动退避重试 | 需要无人值守跑长任务时 |
 | 模型不保证确定性 | 同一提示两次可能给出不同动作；续跑结果取决于模型侧的温度设置 | 接真实模型服务时 |
 | 截断会丢掉尾部信息 | 模型只看得到前 200 字，长回执的关键内容可能恰好在后面 | 结果内容变长、或模型频繁误判时 |
 | 策略配置未持久化 | 模型续跑需再次传 `--policy model`；脚本续跑仍需原脚本 | 需要任务自动恢复或服务化时 |
@@ -630,20 +655,18 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 账本锁是整文件粒度 | 两个不同账户的转账也互相排队；写操作等锁上限 5s | 账户数或并发度上升时 |
 | 账本锁只对同机进程有效 | NFS / SMB 上的文件锁语义不一，可能退化为不互斥 | 账本放到共享存储时 |
 | 租约状态只在查看时可见 | `status` 是一次快照，没有「即将过期」的告警通道；过期后也不会自动通知任何人 | 接入运维告警或多任务调度时 |
-| 工具调用没有超时 | 工具卡在死循环或永不返回的等待上时，心跳照常续租，租约不会过期，别人也接不了手——只能靠人杀掉进程、再由 TTL 兜底。给工具加超时会把「没等到结果」记成 `UNCERTAIN`，语义正确，但需要额外线程与分类，19C 明确决定不做 | 出现无人值守的长任务时 |
 | 归还只覆盖「走到 finally」的路径 | 进程在归还前被杀，仍要走 TTL；没有「退出前写遗嘱」这类机制 | 需要更快接管时 |
 | 镜像只在单机单架构验证过 | 实跑覆盖的是 Docker Desktop（WSL2 后端）+ `linux/amd64`：构建、非 root 身份、`/data` 权限、命名卷持久化、脚本任务与 `verify` 都过了，但没有 arm64 构建，也没在纯 Docker Engine（无 Desktop）上验证。多架构要 buildx 与额外构建时间 | 发布到 Apple Silicon 或 Linux 服务器时 |
 | 镜像没有健康检查与资源限额 | `Dockerfile` 和 compose 都没有 `HEALTHCHECK`，也没写内存 / CPU 限额；容器跑飞了只能靠外部观察发现 | 长期驻留运行或与他人共享宿主机时 |
 
-## 9. 未来模块（未创建）
+## 9. 未创建的东西
 
-| 文件 | 计划职责 | 引入轮次 |
-|---|---|---|
-| `lease.py` | owner、租约、心跳、epoch 与条件写入（日志 fencing） | v2：多 worker 接管 |
+没有计划中的新模块。早期设想过独立的 `lease.py`，最后没有落地：租约与栅栏落在日志层
+（D45），因为只有事件日志的写入事务能同时保证「序号分配」与「租约校验」在同一个
+原子动作里，独立模块反而要多引一层跨进程锁。
 
-### 2026-10-30：真实模型展示配置
+### 演示边界（2026-10-30）
 
-- D58：默认展示使用 `ModelPolicy` + `client_from_env()` 连接真实服务，无假模型回退。
-- D59：凭据仅保存在 Git 忽略的 `agentrun.local.toml`，模板与测试不含真实密钥；环境变量可逐字段覆盖。
 - 自动测试继续使用隔离配置与本地 HTTP 服务，进程级故障夹具保留确定性脚本策略。
-- 模拟账本、故障注入、人工复核与真实模型请求在演示输出中分别标明。
+- 模拟账本、故障注入、人工复核与真实模型请求在演示输出中分别标明，不混在一起。
+- 真实模型展示的装配方式与凭据位置见 §5 的 D58 / D59。
