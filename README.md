@@ -51,13 +51,13 @@
 - **租约依赖本机时钟**：跨机器部署时 `expires_at` 不可比。
 - **镜像只验证过 linux/amd64**：没有 arm64 构建，也没有 `HEALTHCHECK` 与资源限额。
 
-完整清单（含每条债务的触发条件）见 `PROJECT_LAYOUT.md` §8。
+完整清单（含每条债务的触发条件）见 [`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md) §8。
 
 想先看「为什么这样设计」，读 [`docs/design.md`](docs/design.md)：三个选择（事件日志、栅栏、不用 ReAct）与各自的代价。
 
 想先看「它到底跑通了什么」，读 [`docs/scenarios.md`](docs/scenarios.md)：8 个真实模型场景的期望结局，以及每个场景对应的离线契约测试。
 
-实现契约与接口见 `PROJECT_LAYOUT.md`，逐轮的取舍与返工见 `LEARNING_LOG.md`。
+实现契约与接口见 [`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md)，逐轮的取舍与返工见 [`docs/LEARNING_LOG.md`](docs/LEARNING_LOG.md)。
 
 ## 5 分钟：从空目录到余额变化
 
@@ -330,9 +330,13 @@ LangChain/服务对某些模型的温度参数可能有限制；相同提示也�
 src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器与客户端、日志、引擎、对账、CLI
 tests/               契约测试
 scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核、进程级故障注入、评测集
+docs/                给人读的五份：
+  design.md            为什么这样设计：三个选择与各自的代价
+  scenarios.md         8 个真实场景的期望结局与证据
+  PROJECT_LAYOUT.md    当前契约：接口、不变量、决策与债务
+  LEARNING_LOG.md      逐轮复盘：踩了什么坑、怎么定位
+  ROUND18_PLAN.md      最后一轮的计划与完成记录
 .github/workflows/   CI 配置
 agentrun.example.toml  可提交的配置模板，不含真实凭据
 agentrun.local.toml    本机模型配置，被 Git 忽略
-PROJECT_LAYOUT.md    当前契约：目录、接口、决策、验证记录
-LEARNING_LOG.md      学习记录与复盘
 ```

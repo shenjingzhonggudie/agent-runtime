@@ -21,12 +21,12 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 项目2/
 ├─ pyproject.toml            依赖与工具配置唯一来源（pytest / ruff / mypy）
 ├─ README.md                 产品入口：5 分钟跑一遍、能力与边界
-├─ docs/
+├─ docs/                     给人读的五份（README 留在根目录做门面）
 │  ├─ design.md              为什么这样设计：三个选择与各自的代价
-│  └─ scenarios.md           8 个真实模型场景的期望结局与证据链
-├─ PROJECT_LAYOUT.md         当前契约：接口、不变量、决策与债务
-├─ LEARNING_LOG.md           逐轮过程：踩了什么坑、怎么定位、留下什么债务
-├─ ROUND18_PLAN.md           第 18 轮的计划与完成记录
+│  ├─ scenarios.md           8 个真实模型场景的期望结局与证据链
+│  ├─ PROJECT_LAYOUT.md      当前契约：接口、不变量、决策与债务
+│  ├─ LEARNING_LOG.md        逐轮过程：踩了什么坑、怎么定位、留下什么债务
+│  └─ ROUND18_PLAN.md        第 18 轮的计划与完成记录
 ├─ agentrun.example.toml     可提交的配置模板
 ├─ agentrun.local.toml       本机模型配置（Git 忽略，不含在仓库交付中）
 ├─ .gitignore
