@@ -12,7 +12,7 @@ from agentrun.ledger_tools import Transfer
 from agentrun.tools import ToolContext, ToolRejected, ToolStatus, run_tool
 
 ROOT = Path(__file__).resolve().parents[1]
-HAMMER = ROOT / "scripts" / "ledger_hammer.py"
+HAMMER = ROOT / "scripts" / "evidence" / "ledger_hammer.py"
 CTX = ToolContext(run_id="run-1", step=2, attempt=1, step_key="run-1:2")
 
 

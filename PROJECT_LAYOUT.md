@@ -8,7 +8,7 @@
 | 项 | 状态 |
 |---|---|
 | 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、CLI 七个子命令 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、产品入口（ask / ledger）、CLI 九个子命令 |
 | 未实现能力 | 跨机器时钟同步；真实外部支付系统接入 |
 | 运行前提 | Python >= 3.14；运行依赖 `langchain-openai`；自动测试离线运行；展示脚本与 CLI 模型模式连接配置的真实服务 |
 
@@ -25,20 +25,25 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ├─ .gitignore
 ├─ .github/workflows/ci.yml  CI：安装 → lint → format → mypy → pytest
 ├─ scripts/
-│  ├─ crash_window_demo.py   崩溃窗口对比实验（教学脚本，非引擎代码）
-│  ├─ ledger_demo.py         账本工具演示：一次完整运行 + 一次对账式续跑（教学脚本）
-│  ├─ recovery_demo.py       落盘与恢复演示：重开读回、崩溃现场重放（教学脚本）
-│  ├─ reconcile_demo.py      崩溃 → 对账 → 续跑的完整链路（教学脚本）
-│  ├─ model_policy_demo.py   真实模型策略：工具决策、重启续跑（联网展示）
-│  ├─ review_demo.py         崩溃 → 查不到 → 人工复核 → 重做 / 终止（教学脚本）
-│  ├─ _live_demo.py         真实客户端、工具注册表与调用计数（展示共用）
-│  ├─ crash_runner.py        进程级故障注入：os._exit 在三个窗口退出（测试夹具）
-│  ├─ lease_worker.py        租约 worker：hold / takeover 两个模式（测试夹具）
-│  ├─ ledger_hammer.py       账本并发夹具：连做 N 次转账 / 占住账本锁（测试夹具）
-│  ├─ _probe_ledger_race.py  探针：两进程并发转账，核对成功次数与记账条数
-│  ├─ _probe_lock.py         探针：文件锁的跨进程互斥与进程被杀后自动释放
-│  ├─ _probe_journal_read.py 探针兼夹具：一边写一边读，统计完整性误报
-│  └─ eval_suite.py          真实模型评测：8 个场景一张表
+│  ├─ eval_suite.py          真实模型评测：8 个场景一张表（入口）
+│  ├─ _dep_graph.py          AST 依赖图：分层、环、外部依赖（工具）
+│  ├─ demo/                  教学与展示：联网、需要模型配置
+│  │  ├─ model_policy_demo.py 真实模型策略：工具决策、重启续跑
+│  │  ├─ ledger_demo.py       账本工具：一次完整运行 + 一次对账式续跑
+│  │  ├─ recovery_demo.py     落盘与恢复：重开读回、崩溃现场重放
+│  │  ├─ reconcile_demo.py    崩溃 → 对账 → 续跑的完整链路
+│  │  ├─ review_demo.py       崩溃 → 查不到 → 人工复核 → 重做 / 终止
+│  │  ├─ crash_window_demo.py 崩溃窗口对比实验
+│  │  └─ _live_demo.py        真实客户端、工具注册表与调用计数（共用）
+│  └─ evidence/              证据与夹具：测试会直接调用
+│     ├─ crash_runner.py      进程级故障注入：os._exit 在三个窗口退出
+│     ├─ lease_worker.py      租约 worker：hold / takeover 两个模式
+│     ├─ ledger_hammer.py     账本并发：连做 N 次转账 / 占住账本锁
+│     ├─ _diag_lease_timing.py 租约事务耗时分布（定 TTL 的依据）
+│     ├─ _probe_ledger_race.py 两进程并发转账，核对成功次数与记账条数
+│     ├─ _probe_lock.py       文件锁的跨进程互斥与进程被杀后自动释放
+│     ├─ _probe_journal_read.py 一边写一边读，统计完整性误报
+│     └─ _probe_double_resolve.py 两次「确认成功」同时到达时日志会怎样
 ├─ src/agentrun/
 │  ├─ __init__.py            包入口，__version__
 │  ├─ demo.py                模拟账本（外部世界）：Ledger / Record / LedgerRejected / LedgerCorrupted
@@ -364,6 +369,9 @@ events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
 
 | 子命令 | 关键参数 | 退出码 |
 |---|---|---|
+| `ask` | `"<一句话>" [--run-id] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或待续跑 / 2 任务已存在、配置错或租约忙 |
+| `ledger init` | `[--A N] [--B N]` | 0 建好或已存在 / 2 一个账户都没给 |
+| `ledger balance` | `[--account NAME]` | 0；未知账户按 0 显示 |
 | `run` | `--run-id [--policy {script,model}] [--script] [--task] [--max-steps] [--owner] [--lease-ttl]` | 0 成功 / 1 失败、耗尽或失联 / 2 参数、脚本、配置或租约忙 |
 | `resume` | `--run-id [--policy {script,model}] [--script] [--owner] [--lease-ttl]` | 同上；任务不存在时 2 |
 | `status` | `--run-id` | 0 / 任务不存在时 2；额外打印租约持有者与剩余时间 |

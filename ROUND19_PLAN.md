@@ -210,6 +210,27 @@
 
 **验收**：一条命令链能从空目录跑到"账本余额变化"，全程不需要看 `scripts/`。
 
+**完成记录（2026-11-01）**
+
+- `agentrun ask "从账户 A 转 250 到账户 B"`：自动生成 `run_id`
+  （`ask-YYYYMMDD-HHMMSS`，要能复制去跑 `status` / `resume`），装配模型策略，打印
+  结论、步数、余额与停止原因；没跑成时直接写出下一步该敲的命令。
+- `agentrun ledger init --A=1000 --B=0` / `ledger balance [--account A]`：账本不再需要
+  去翻 `scripts/`。账本已存在时 `initial` 被忽略（`Ledger` 的构造语义），不加 `--force`
+  覆盖——重置该是显式、带备份的动作。
+- `Ledger.snapshot()`：只读、取锁、返回副本，供 `balance` 打印全部账户。
+- 脚本分层：`scripts/` 根只留 `eval_suite.py` 与 `_dep_graph.py`；教学脚本进 `demo/`，
+  探针与测试夹具进 `evidence/`。四条测试里写死的脚本路径同步更新；`eval_suite.py` 用
+  `sys.path` 把 `demo/` 加进搜索路径——入口不该要求调用方先设 `PYTHONPATH`。
+- README 顶部加「5 分钟：从空目录到余额变化」，含一次真实运行的输出片段。
+- 端到端实测：空目录 → `ledger init` → `ask` → 余额 `A: 750 / B: 250`，4 步，
+  `SUCCEEDED`。
+- 用例：`tests/test_cli_ask.py`（7 条）。
+
+一个踩到的坑：`ask "给 B 转 250"` 会被模型理解成「从 B 转出」，因为它不知道谁是付款
+方。README 的示例因此写成「从账户 A 转 250 到账户 B」——提示里没有账户语义，措辞必须
+自带主客体。
+
 ### 19J｜新事件字段进审计（并入 19B）
 
 LangChain 改造与后续新增事件可能带入新 payload 字段。19B 的 schema 版本与哈希链要覆盖

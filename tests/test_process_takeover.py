@@ -14,7 +14,7 @@ from agentrun.journal import SqliteEventLog
 from agentrun.model import RunStatus, replay
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "scripts" / "lease_worker.py"
+WORKER = ROOT / "scripts" / "evidence" / "lease_worker.py"
 RUN = "takeover"
 
 

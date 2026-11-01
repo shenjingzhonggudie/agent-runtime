@@ -1,7 +1,9 @@
 """命令行入口：把已有模块组装成可执行命令。
 
-七个子命令，各自只做一件事：
+九个子命令，各自只做一件事：
 
+- ``ask``：用一句话跑一个任务，打印结论与余额。外人的入口。
+- ``ledger``：初始化账本或查看余额。
 - ``run``：从 JSON 脚本或模型决策跑一个新任务。
 - ``resume``：在已有日志上继续跑。
 - ``status``：打印视图与每一步的当前状态。
@@ -22,10 +24,11 @@ import argparse
 import json
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .demo import Ledger
+from .demo import Ledger, LedgerBusy, LedgerCorrupted
 from .engine import Engine, NothingToResume, StopReason
 from .journal import JournalCorrupted, Lease, LeaseBusy, RunAlreadyStarted, SqliteEventLog
 from .ledger_tools import GetBalance, LookupRequest, SaveReceipt, Transfer
@@ -373,10 +376,154 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 1 if broken else 0
 
 
+def print_balances(ledger: Ledger) -> None:
+    """打印全部账户余额，按账户名排序。
+
+    Args:
+        ledger: 已打开的账本。
+
+    Notes:
+        空账本也要说一句「还没有账户」：否则输出看起来像命令失败，人会去翻日志找错。
+    """
+    balances = ledger.snapshot()
+    if not balances:
+        print("  （账本里还没有账户）")
+        return
+    for name, value in sorted(balances.items()):
+        print(f"  {name}: {value}")
+
+
+def cmd_ledger_init(args: argparse.Namespace) -> int:
+    """初始化账本并打印初始余额。
+
+    Args:
+        args: 含 ``ledger`` 目录与 ``account_a`` / ``account_b``。
+
+    Returns:
+        int: 0 表示建好或已存在，2 表示一个账户都没给。
+
+    Raises:
+        LedgerBusy: 另一个进程正在初始化同一个目录。
+
+    Notes:
+        账本已经存在时 ``initial`` 会被忽略——这是 ``Ledger`` 的构造语义，不能拿它重置
+        余额。不在这里加「--force 覆盖」：重置该是一次显式、带备份的动作，不该藏在
+        init 里顺手发生。
+    """
+    initial: dict[str, int] = {}
+    if args.account_a is not None:
+        initial["A"] = args.account_a
+    if args.account_b is not None:
+        initial["B"] = args.account_b
+    if not initial:
+        print("至少给一个初始余额，例如 --A=1000 --B=0")
+        return 2
+
+    ledger = Ledger(args.ledger, initial=initial)
+    print(f"账本：{args.ledger}")
+    print_balances(ledger)
+    return 0
+
+
+def cmd_ledger_balance(args: argparse.Namespace) -> int:
+    """打印账本余额。
+
+    Args:
+        args: 含 ``ledger`` 目录与可选 ``account``。
+
+    Returns:
+        int: 0 表示读到；未知账户按 0 显示。
+    """
+    ledger = Ledger(args.ledger)
+    if args.account is not None:
+        print(f"{args.account}: {ledger.balance(args.account)}")
+        return 0
+    print_balances(ledger)
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """用一句自然语言跑一个任务，并打印人能读的结果。
+
+    Args:
+        args: 含 ``prompt``、``run_id``（可空）、``db``、``ledger``、``max_steps``、
+            ``owner`` 与 ``lease_ttl``。
+
+    Returns:
+        int: 与 ``run`` 一致——只有任务成功是 0；``DECISION_FAILED``、等待复核、
+            预算耗尽都返回 1。
+
+    Raises:
+        ModelClientError: 配置缺失或不可用，由 ``main`` 统一转成退出码 2。
+
+    Notes:
+        ``run_id`` 省略时按时间生成。它要人可读、可复制：出问题时要拿着它去跑
+        ``status`` 或 ``resume``，一串哈希不适合当这个入口。
+
+        与 ``run`` 的差别只在输出：这个命令默认就是「我要看结果」，所以直接打印结论、
+        步数与余额，并把下一步该敲什么写出来。
+    """
+    run_id = args.run_id or f"ask-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+    policy = ModelPolicy(client_from_env(), LEDGER_TOOL_SPECS)
+    log = SqliteEventLog(args.db)
+    engine = Engine(
+        policy,
+        build_registry(args.ledger),
+        log,
+        owner=args.owner,
+        lease_ttl=args.lease_ttl,
+    )
+
+    print(f"任务：{args.prompt}")
+    try:
+        result = engine.run(run_id, args.prompt, args.max_steps)
+    except RunAlreadyStarted as exc:
+        print(f"任务已存在：{exc}")
+        return 2
+    except LeaseBusy as exc:
+        print(f"没有拿到租约：{exc}")
+        return 2
+
+    view = result.view
+    print(f"结论：{view.answer if view.answer is not None else '（未得出结论）'}")
+    print(f"步数：{len(view.steps)}/{view.max_steps}")
+    print("余额：")
+    print_balances(Ledger(args.ledger))
+    print(f"停止原因：{result.stop_reason}")
+    if result.stop_reason is not StopReason.SUCCEEDED:
+        print(f"回看：agentrun status --run-id {run_id}")
+        print(f"继续：agentrun resume --run-id {run_id} --policy model")
+    return exit_code_for(result.stop_reason)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造参数解析器。"""
     parser = argparse.ArgumentParser(prog="agentrun", description="事件溯源执行引擎")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    ask_p = sub.add_parser("ask", help="用一句话跑一个任务（模型策略）")
+    ask_p.add_argument("prompt", help="自然语言任务，例如「给 B 转 250」")
+    ask_p.add_argument("--run-id", default=None, help="省略时按时间生成")
+    ask_p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    ask_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
+    ask_p.add_argument("--max-steps", type=int, default=10)
+    ask_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
+    ask_p.add_argument("--lease-ttl", type=float, default=30.0)
+    ask_p.set_defaults(func=cmd_ask)
+
+    ledger_p = sub.add_parser("ledger", help="初始化或查看模拟账本")
+    ledger_sub = ledger_p.add_subparsers(dest="ledger_command", required=True)
+
+    ledger_init = ledger_sub.add_parser("init", help="创建账本并设置初始余额")
+    ledger_init.add_argument("--A", type=int, default=None, dest="account_a", help="账户 A 的余额")
+    ledger_init.add_argument("--B", type=int, default=None, dest="account_b", help="账户 B 的余额")
+    ledger_init.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
+    ledger_init.set_defaults(func=cmd_ledger_init)
+
+    ledger_balance = ledger_sub.add_parser("balance", help="打印账户余额")
+    ledger_balance.add_argument("--account", default=None, help="只打印这个账户")
+    ledger_balance.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
+    ledger_balance.set_defaults(func=cmd_ledger_balance)
 
     run_p = sub.add_parser("run", help="从脚本或模型决策跑一个新任务")
     run_p.add_argument("--run-id", required=True)
@@ -464,6 +611,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except JournalCorrupted as exc:
         print(f"事件日志不完整：{exc}")
+        return 2
+    except LedgerCorrupted as exc:
+        print(f"账本不可读：{exc}")
+        return 2
+    except LedgerBusy as exc:
+        print(f"账本忙：{exc}")
         return 2
     except InvalidEvent as exc:
         print(f"日志内容非法：{exc}")

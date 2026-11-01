@@ -8,6 +8,7 @@
     .\\.venv\\Scripts\\python.exe scripts\\eval_suite.py
 """
 
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,7 +16,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from _live_demo import build_live_policy
+# 其余演示脚本在 scripts/demo/ 下。评测集是入口，不该要求调用方先设 PYTHONPATH，
+# 所以按自己的位置把它加进搜索路径。
+sys.path.insert(0, str(Path(__file__).resolve().parent / "demo"))
+
+from _live_demo import build_live_policy  # noqa: E402
 
 from agentrun.demo import Ledger
 from agentrun.engine import Engine, StopReason

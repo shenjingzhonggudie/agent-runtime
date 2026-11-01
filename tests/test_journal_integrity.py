@@ -18,7 +18,7 @@ from agentrun.model import InvalidEvent, replay
 RUN = "run-a"
 STARTED = {"task": "转账 250", "max_steps": 10}
 ROOT = Path(__file__).resolve().parents[1]
-PROBE = ROOT / "scripts" / "_probe_journal_read.py"
+PROBE = ROOT / "scripts" / "evidence" / "_probe_journal_read.py"
 
 
 def build_log(tmp_path: Path) -> tuple[SqliteEventLog, Path]:

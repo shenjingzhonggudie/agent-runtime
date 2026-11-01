@@ -32,13 +32,49 @@
 - 多 worker：`--owner` 启用租约，每次写事件带 `epoch` 栅栏；租约过期后可被接管，旧 worker 的写入被拒绝（`LOST`），任务状态不变。
 - 工具调用期间有后台心跳按 `ttl/3` 续租：一次慢调用不会让租约过期，接手者也不会在「这一步还在执行」时闯进来。心跳失败只置 lost、不打断正在跑的工具——等它返回，下一次写入由栅栏拒绝。
 - 栅栏只保护日志：它不能阻止旧 worker 已经发出的工具调用，那部分仍靠对账与复核兜底。
-- `scripts/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
+- `scripts/evidence/lease_worker.py` 与 `tests/test_process_takeover.py` 用两个真实进程验证接管。
 - 日志读侧验真：缺号、末尾被删、事件归属别的 `run_id` 一律抛 `JournalCorrupted`，不返回残缺序列；两次 SELECT 在同一个只读事务里，不会被并发写者插队。
 - 每条事件另存上一条的摘要，`verify` 重算全链并指出第一个断点：把中间一条删掉、把后面那条重写成合法 `seq`、再改小 `last_seq`，序列会重新自洽，`read` 看不出问题——只有链会指错。迁移前的记录没有摘要，`verify` 会如实说「这段无法自证」。
 - 账本所有公开方法都在 `ledger.lock` 的跨进程独占锁里完成读改写；拿不到锁抛 `LedgerBusy`（**确定未生效**），工具层映射成「业务拒绝」而不是「结果未知」。锁由内核持有，进程被杀即释放。
 - 一次 `run` / `resume` 结束时（成功、失败、耗尽、未知、失联都算）归还租约：干净退出的任务下一个 worker 立刻能接手，只有崩溃才等 TTL。`status` 会打印租约持有者与剩余时间，过期则标「可被接管」。
 
 里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
+
+## 5 分钟：从空目录到余额变化
+
+```powershell
+# 1. 建账本：A 有 1000，B 是 0
+.\.venv\Scripts\python.exe -m agentrun.cli ledger init --A=1000 --B=0
+
+# 2. 用一句话让它跑：模型自己选工具、自己填参数
+.\.venv\Scripts\python.exe -m agentrun.cli ask "从账户 A 转 250 到账户 B"
+
+# 3. 再确认一次余额
+.\.venv\Scripts\python.exe -m agentrun.cli ledger balance
+```
+
+第二步的实际输出（模型措辞每次不同，形状不变）：
+
+```
+任务：从账户 A 转 250 到账户 B
+
+结论：任务已完成：已从账户 A 向账户 B 转账 250，并通过 lookup_request 确认该笔转账已生效。
+步数：4/6
+余额：
+  A: 750
+  B: 250
+停止原因：SUCCEEDED
+```
+
+不需要看 `scripts/`：`ask` 会自动生成 `run_id`、装配模型策略、执行工具，并打印结论、步数与余额。没跑成时它会直接把下一步该敲的 `status` / `resume` 写出来。
+
+三种入口的分工：
+
+| 命令 | 什么时候用 |
+|---|---|
+| `ask` | 第一次用，或者只想看结果 |
+| `run` / `resume` | 要指定 `run_id`、用脚本策略、或多 worker 时 |
+| `status` / `trace` / `verify` | 回看、排障、证明日志没被改过 |
 
 ## 环境准备
 
@@ -168,22 +204,22 @@ LangChain/服务对某些模型的温度参数可能有限制；相同提示也�
 
 ```powershell
 # 建议先看：真实模型选择工具、得到反馈，并展示中断后续跑
-.\.venv\Scripts\python.exe scripts\model_policy_demo.py
+.\.venv\Scripts\python.exe scripts\demo\model_policy_demo.py
 
 # 再看：账本工具、持久化重放、对账、人工复核
-.\.venv\Scripts\python.exe scripts\ledger_demo.py
-.\.venv\Scripts\python.exe scripts\recovery_demo.py
-.\.venv\Scripts\python.exe scripts\reconcile_demo.py
-.\.venv\Scripts\python.exe scripts\review_demo.py
+.\.venv\Scripts\python.exe scripts\demo\ledger_demo.py
+.\.venv\Scripts\python.exe scripts\demo\recovery_demo.py
+.\.venv\Scripts\python.exe scripts\demo\reconcile_demo.py
+.\.venv\Scripts\python.exe scripts\demo\review_demo.py
 
 # 崩溃窗口对比，以及 8 个真实模型评测场景
-.\.venv\Scripts\python.exe scripts\crash_window_demo.py
+.\.venv\Scripts\python.exe scripts\demo\crash_window_demo.py
 .\.venv\Scripts\python.exe scripts\eval_suite.py
 ```
 
 每个展示打印实际模型请求次数，不会在网络失败时改用预设回答。模型得到历史步骤与工具说明，返回 JSON 动作；工具参数也来自模型回答。引擎负责校验、记录和执行。已经完成、正在等复核或结果未知的任务会按恢复规则停止，可能不需要新的模型请求。
 
-这里的真实部分是模型服务。余额和转账发生在隔离的模拟账本，崩溃与丢响应由演示代码明确注入；人工复核结论由演示者给出，不交给模型替人审批。`crash_window_demo.py` 先获得真实模型决策，再在三种存储设计中重放同一动作作对比，属于教学实验。
+这里的真实部分是模型服务。余额和转账发生在隔离的模拟账本，崩溃与丢响应由演示代码明确注入；人工复核结论由演示者给出，不交给模型替人审批。`scripts/demo/crash_window_demo.py` 先获得真实模型决策，再在三种存储设计中重放同一动作作对比，属于教学实验。
 
 ## 本地检查
 

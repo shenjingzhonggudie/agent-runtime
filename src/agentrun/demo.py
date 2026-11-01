@@ -330,6 +330,25 @@ class Ledger:
         with self.lock():
             return cast(int, self._load()["balances"].get(owner, 0))
 
+    def snapshot(self) -> dict[str, int]:
+        """返回全部账户余额的快照。
+
+        Returns:
+            dict[str, int]: 账户名到余额的副本；空账本返回空字典。
+
+        Raises:
+            LedgerCorrupted: 账本文件不可读，或余额字段不是整数。
+            LedgerBusy: 等锁超时，这次没有读到任何东西。
+
+        Notes:
+            返回新字典：改它不影响磁盘，也不影响下一次读取。与 ``balance`` 一样取锁——
+            ``os.replace`` 在 Windows 上会与「别人正打开目标文件」冲突，排队之后读到的
+            一定是某一次完整写入的结果，而不是半份。
+        """
+        with self.lock():
+            balances = cast(dict[str, int], self._load()["balances"])
+            return dict(balances)
+
     def transfer(
         self,
         src: str,

@@ -20,7 +20,7 @@ from agentrun.reconcile import reconcile, resolve
 from agentrun.tools import ToolRegistry
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "scripts" / "crash_runner.py"
+RUNNER = ROOT / "scripts" / "evidence" / "crash_runner.py"
 RUN = "crash-run"
 ALICE = "alice"
 BOB = "bob"
