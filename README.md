@@ -62,6 +62,10 @@
 ## 5 分钟：从空目录到余额变化
 
 ```powershell
+# 先进入项目根目录：下面所有 .\.venv\Scripts\ 都是相对路径，
+# 在别的目录执行会报「无法将 .\.venv\Scripts\python.exe 项识别为 cmdlet」
+cd C:\Users\王佳浩\Desktop\项目2
+
 # 0. Windows PowerShell 下先设编码，否则中文输出是乱码（只影响显示，不影响数据）
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $env:PYTHONIOENCODING = "utf-8"
@@ -124,7 +128,7 @@ $env:PYTHONIOENCODING = "utf-8"
 
 ## 环境准备
 
-已验证环境：Windows + Python 3.14.6。
+已验证环境：Windows + Python 3.14.6。本节的命令都在**项目根目录**下执行。
 
 ```powershell
 python -m venv .venv
