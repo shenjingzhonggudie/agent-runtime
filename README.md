@@ -62,7 +62,11 @@
 ## 5 分钟：从空目录到余额变化
 
 ```powershell
-# 1. 建账本：A 有 1000，B 是 0
+# 0. Windows PowerShell 下先设编码，否则中文输出是乱码（只影响显示，不影响数据）
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+
+# 1. 建账本：A 有 1000，B 是 0。必须在 ask 之前
 .\.venv\Scripts\python.exe -m agentrun.cli ledger init --A=1000 --B=0
 
 # 2. 用一句话让它跑：模型自己选工具、自己填参数
@@ -86,6 +90,29 @@
 ```
 
 不需要看 `scripts/`：`ask` 会自动生成 `run_id`、装配模型策略、执行工具，并打印结论、步数与余额。没跑成时它会直接把下一步该敲的 `status` / `resume` 写出来。
+
+### 跑完之后，文件落在哪
+
+当前目录下会多出两样东西，都不进版本控制：
+
+| 路径 | 是什么 |
+|---|---|
+| `agentrun.db` | 事件日志（SQLite）。`status` / `trace` / `verify` 读的就是它 |
+| `ledger/ledger.json` | 模拟账本的状态：余额与全部记录 |
+| `ledger/ledger.lock` | 同目录下的跨进程锁，进程退出由内核释放 |
+
+两者都是**相对路径**，所以位置取决于你在哪个目录启动命令。想放到别处就显式指定：
+
+```powershell
+.\.venv\Scripts\python.exe -m agentrun.cli ask "从账户 A 转 250 到账户 B" --db var\events.db --ledger var\ledger
+```
+
+容器里则固定是 `/data`，由命名卷 `agentrun-data` 持久化，`docker compose down -v` 才会清掉。
+
+两个容易踩的点：
+
+- **顺序**：`ledger init` 必须在 `ask` 之前。`ask` 会顺手建一个空账本；账本已存在时 `initial` 被忽略，此时再 `init --A=1000` 只会看到「账本里还没有账户」。
+- **`ledger init` 不接受 `--db`**：它只管账本（`--ledger`）。带上 `--db` 会直接 `unrecognized arguments`。
 
 三种入口的分工：
 
