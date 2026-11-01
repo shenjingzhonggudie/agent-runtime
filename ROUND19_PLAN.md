@@ -162,9 +162,25 @@
 无论走哪条，都要同时补齐不需要凭据的那部分：请求体精确断言、错误映射矩阵
 （401 / 429 / 5xx / 超时 / 非 JSON / 缺字段）、`client_from_env` 缺变量报错。
 
-### 19G｜Docker（建议不做）
+### 19G｜Docker
 
-任务书允许不引入容器化。目前触发信号（CLI 稳定 + 跨机需求）都未成立，只保留债务条目。
+任务书允许不引入容器化。原计划建议不做：触发信号（CLI 稳定 + 跨机需求）都未成立。
+2026-11-01 需求方明确要求做，改为交付。
+
+**完成记录（2026-11-01）**
+
+- `Dockerfile`：`python:3.14-slim`，只装运行依赖（`pip install .`，不含 dev extras），
+  非 root（uid 10001），工作目录 `/data`，`ENTRYPOINT ["agentrun"]`。
+- `.dockerignore`：排除 `.venv`、缓存、`*.db`、`ledger/`、`agentrun.local.toml` 与开发
+  资料——本机状态与密钥绝不进镜像。
+- `docker-compose.yml`：命名卷 `agentrun-data:/data`，模型配置走 `AGENTRUN_*` 环境变量。
+- `PIP_INDEX` 做成 build-arg，并在 `RUN` 前置 `PIP_INDEX_URL`：pip 构建隔离环境时会再
+  起一个子进程装 setuptools，那个子进程只认环境变量。
+- README 加「在 Docker 里跑」，含构建、初始化、`ask`、`verify` 与两条限制（多容器共享
+  卷时 SQLite 锁的边界、镜像不读宿主机配置）。
+- **未验证**：本机没有 Docker，构建与运行都没跑过。已做的静态核对只有三条——
+  console script `agentrun.exe` 存在、`pip install --dry-run --no-deps` 能产出
+  `agentrun-0.1.0.dev0` 元数据、依赖清单与 `requires-python` 完整。债务表已如实记下。
 
 ### 19H｜模型适配层收口（P1，学习者在 2026-10-30 加入 LangChain 之后必做）
 

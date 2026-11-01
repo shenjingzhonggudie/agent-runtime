@@ -94,6 +94,40 @@ python -m venv .venv
 
 **必须用 `.venv` 里的解释器**：`agentrun` 只装在虚拟环境中，用系统 Python 会得到 `ModuleNotFoundError`。
 
+## 在 Docker 里跑
+
+不想装 Python 也可以用容器。镜像只装运行依赖（不含 pytest / ruff / mypy），数据落在命名卷 `agentrun-data` 里。
+
+```powershell
+# 构建（中国大陆网络可换源：加 --build-arg PIP_INDEX=...）
+docker compose build
+
+# 建账本
+docker compose run --rm agentrun ledger init --A=1000 --B=0
+
+# 用一句话跑
+docker compose run --rm agentrun ask "从账户 A 转 250 到账户 B"
+
+# 校验事件链
+docker compose run --rm agentrun verify
+```
+
+模型配置走环境变量，镜像里不含 `agentrun.local.toml`：
+
+```powershell
+$env:AGENTRUN_BASE_URL = "https://api.example.com/v1"
+$env:AGENTRUN_API_KEY = "..."
+$env:AGENTRUN_MODEL = "..."
+docker compose run --rm agentrun ask "从账户 A 转 250 到账户 B"
+```
+
+容器内工作目录固定 `/data`，所以默认的 `agentrun.db` 与 `ledger/` 都落在卷里，不用每次传路径。想换成宿主机目录，把 `agentrun-data:/data` 换成 `./state:/data`，并把宿主机目录属主改成容器内的 uid `10001`（Windows 的 Docker Desktop 不需要）。
+
+两条限制：
+
+- 多容器共享同一个卷并同时写入时，SQLite 的文件锁只在同一台宿主机、同一文件系统下可靠；NFS / SMB 上不成立。
+- 镜像里没有 `agentrun.local.toml`，也不会读宿主机那一份。配置只能走环境变量或显式挂载。
+
 ## 命令行
 
 展示时使用模型策略，任务输入为自然语言：

@@ -8,7 +8,7 @@
 | 项 | 状态 |
 |---|---|
 | 当前里程碑 | 第 17 轮完成：仓库上线 GitHub，CI 在 Linux 实跑通过 |
-| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、产品入口（ask / ledger）、CLI 九个子命令 |
+| 已实现能力 | 包骨架、模拟账本（跨进程互斥、崩溃自释放）、事件契约、事件折叠、工具协议与单次执行、策略协议与脚本策略、模型策略适配器（提示渲染 + 严格解析 + 长度预算）、HTTP 模型客户端（OpenAI 兼容）、内存与 SQLite 两种事件日志、租约与 epoch 栅栏（跨进程接管）、租约主动归还与可见性、日志完整性校验（缺号 / 缺尾 / 跨 run 混入）、引擎主循环与预算、引擎续跑与决策复用、自动对账补记、人工复核（REQUESTED / RESOLVED / 三种结论）、失败原因入视图、账本工具适配器、事件编解码、时间线与 JSONL 导出、进程级故障注入与恢复、真实模型评测、本地 TOML 配置、决策失败可重试、启动唯一性、复核幂等、哈希链审计、产品入口（ask / ledger）、CLI 九个子命令、Docker 运行镜像 |
 | 未实现能力 | 跨机器时钟同步；真实外部支付系统接入 |
 | 运行前提 | Python >= 3.14；运行依赖 `langchain-openai`；自动测试离线运行；展示脚本与 CLI 模型模式连接配置的真实服务 |
 
@@ -24,6 +24,9 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 ├─ agentrun.local.toml       本机模型配置（Git 忽略，不含在仓库交付中）
 ├─ .gitignore
 ├─ .github/workflows/ci.yml  CI：安装 → lint → format → mypy → pytest
+├─ Dockerfile                运行镜像：Python 3.14 slim、非 root、数据在 /data
+├─ .dockerignore             本机状态与密钥不进构建上下文
+├─ docker-compose.yml        单容器：命名卷 + AGENTRUN_* 环境变量
 ├─ scripts/
 │  ├─ eval_suite.py          真实模型评测：8 个场景一张表（入口）
 │  ├─ _dep_graph.py          AST 依赖图：分层、环、外部依赖（工具）
@@ -563,7 +566,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，ubuntu-latest + Python 3.14 | 同上四条 | **已推送并实跑通过**（run 40189098128） |
-| Docker | 未引入 | — | 触发信号：CLI 稳定且出现跨机/容器需求 |
+| Docker | `Dockerfile` + `docker-compose.yml`，数据在命名卷 | `docker compose run --rm agentrun --help` | **未在本机实跑**：本机没有 Docker，只核对了入口点、打包元数据与依赖清单 |
 
 mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores`、
 `no_implicit_optional`；未开启全局 `strict`，未忽略具体错误码。
@@ -629,7 +632,7 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 租约状态只在查看时可见 | `status` 是一次快照，没有「即将过期」的告警通道；过期后也不会自动通知任何人 | 接入运维告警或多任务调度时 |
 | 工具调用没有超时 | 工具卡在死循环或永不返回的等待上时，心跳照常续租，租约不会过期，别人也接不了手——只能靠人杀掉进程、再由 TTL 兜底。给工具加超时会把「没等到结果」记成 `UNCERTAIN`，语义正确，但需要额外线程与分类，19C 明确决定不做 | 出现无人值守的长任务时 |
 | 归还只覆盖「走到 finally」的路径 | 进程在归还前被杀，仍要走 TTL；没有「退出前写遗嘱」这类机制 | 需要更快接管时 |
-| Docker 未引入 | 无容器化交付 | CLI 稳定 + 跨机需求 |
+| 镜像没有实跑过 | `Dockerfile` / `docker-compose.yml` 只在静态层面核对过（console script 存在、`pip install --dry-run` 能出元数据、依赖清单完整）。本机没有 Docker，构建与运行都未验证；`python:3.14-slim` 是否已有、`pip install` 在容器内能否成功，都要等第一次 build 才知道 | 第一次在有 Docker 的机器上构建时 |
 
 ## 9. 未来模块（未创建）
 

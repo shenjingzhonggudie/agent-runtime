@@ -1,0 +1,26 @@
+# 单容器运行配置。数据放在命名卷 agentrun-data 里，重复 up/down 不会丢事件与账本。
+#
+#   docker compose run --rm agentrun ledger init --A=1000 --B=0
+#   docker compose run --rm agentrun ask "从账户 A 转 250 到账户 B"
+#   docker compose run --rm agentrun verify
+#
+# 模型配置走环境变量（或 .env），镜像里不含 agentrun.local.toml。
+
+services:
+  agentrun:
+    build:
+      context: .
+      args:
+        PIP_INDEX: ${PIP_INDEX:-https://pypi.org/simple}
+    image: agentrun:dev
+    working_dir: /data
+    volumes:
+      - agentrun-data:/data
+    environment:
+      AGENTRUN_BASE_URL: ${AGENTRUN_BASE_URL:-}
+      AGENTRUN_API_KEY: ${AGENTRUN_API_KEY:-}
+      AGENTRUN_MODEL: ${AGENTRUN_MODEL:-}
+      AGENTRUN_TIMEOUT: ${AGENTRUN_TIMEOUT:-30}
+
+volumes:
+  agentrun-data:

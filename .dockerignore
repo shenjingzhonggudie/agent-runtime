@@ -1,0 +1,27 @@
+# 镜像里只需要源码与 pyproject：pip install . 时 setuptools 会读 README.md，
+# 其余一律不进构建上下文。
+
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# 本机状态：绝不能进镜像
+*.db
+*.db-journal
+ledger/
+agentrun.local.toml
+*.tmp
+
+# 不进镜像的开发资料
+tests
+scripts
+docs
+LEARNING_LOG.md
+PROJECT_LAYOUT.md
+ROUND19_PLAN.md
+agentrun.example.toml
