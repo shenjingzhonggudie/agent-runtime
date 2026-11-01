@@ -38,7 +38,11 @@
 - 账本所有公开方法都在 `ledger.lock` 的跨进程独占锁里完成读改写；拿不到锁抛 `LedgerBusy`（**确定未生效**），工具层映射成「业务拒绝」而不是「结果未知」。锁由内核持有，进程被杀即释放。
 - 一次 `run` / `resume` 结束时（成功、失败、耗尽、未知、失联都算）归还租约：干净退出的任务下一个 worker 立刻能接手，只有崩溃才等 TTL。`status` 会打印租约持有者与剩余时间，过期则标「可被接管」。
 
-里程碑与契约见 `PROJECT_LAYOUT.md`，每轮的理解与复盘见 `LEARNING_LOG.md`。
+想先看「为什么这样设计」，读 [`docs/design.md`](docs/design.md)：三个选择（事件日志、栅栏、不用 ReAct）与各自的代价。
+
+想先看「它到底跑通了什么」，读 [`docs/scenarios.md`](docs/scenarios.md)：8 个真实模型场景的期望结局，以及每个场景对应的离线契约测试。
+
+实现契约与接口见 `PROJECT_LAYOUT.md`，逐轮的取舍与返工见 `LEARNING_LOG.md`。
 
 ## 5 分钟：从空目录到余额变化
 
