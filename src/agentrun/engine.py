@@ -7,7 +7,9 @@
     engine → {policy, tools, journal, model, events}
 """
 
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -81,6 +83,72 @@ def _is_retryable(error: PolicyError) -> bool:
     return bool(getattr(error, "retryable", False))
 
 
+class _Heartbeat:
+    """长调用期间的后台续租。
+
+    Args:
+        log: 事件日志。
+        lease: 开始心跳时的租约。
+        ttl: 续租时长（秒）；心跳间隔取 ``ttl / 3``。
+        on_lost: 续租失败时被调用，参数是失败原因。
+
+    Notes:
+        它只续租，不写事件、不碰视图。失败后**不重试**：租约被接管说明这份工作已经
+        属于别人，再争只会制造第二个写入者。
+
+        间隔取 ``ttl / 3`` 而不是 ``ttl / 2``：留两次机会。续租慢一拍不要紧，慢两拍
+        就会被别人抢走——那才是真正要避免的。
+
+        **它不防「工具卡住」。** 工具陷在死循环或永不返回的等待里时，心跳照常续租，
+        租约不会过期，别人也接不了手——那条路径只能靠人杀掉进程，再由 TTL 兜底。
+        根治要给工具调用加超时，并把「没等到结果」记成 ``UNCERTAIN``；本轮明确不做，
+        理由见 ``ROUND19_PLAN`` 的 19C。
+    """
+
+    def __init__(
+        self,
+        log: EventLog,
+        lease: Lease,
+        ttl: float,
+        on_lost: Callable[[BaseException], None],
+    ) -> None:
+        self._log = log
+        self._ttl = ttl
+        self._on_lost = on_lost
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._lease = lease
+        self._thread = threading.Thread(target=self._run, name="agentrun-heartbeat", daemon=True)
+
+    def start(self) -> None:
+        """启动心跳线程。"""
+        self._thread.start()
+
+    def stop(self) -> None:
+        """停止心跳并等待线程退出。
+
+        Notes:
+            最多等 ``ttl + 1`` 秒：续租可能正卡在数据库锁上。超时后不再等——线程是
+            daemon，进程退出不会被它拖住，而主流程不该为一个即将消失的线程停住。
+        """
+        self._stop.set()
+        self._thread.join(timeout=self._ttl + 1.0)
+
+    def _run(self) -> None:
+        """按固定间隔续租，直到被停止或续租失败。"""
+        interval = max(self._ttl / 3.0, 0.01)
+        while not self._stop.wait(interval):
+            with self._lock:
+                current = self._lease
+            try:
+                renewed = self._log.renew(current, self._ttl)
+            except BaseException as exc:  # noqa: BLE001 - 任何失败都可能意味着租约不保
+                self._on_lost(exc)
+                return
+            with self._lock:
+                self._lease = renewed
+
+
 @dataclass(frozen=True, slots=True)
 class EngineResult:
     """一次运行的结果。
@@ -113,6 +181,11 @@ class Engine:
         一次 ``run`` / ``resume`` 结束时（无论成功、失败、耗尽、未知还是失联）都会
         在 ``finally`` 里归还租约；因此「干净退出」的任务下一个 worker 可以立刻接手，
         只有进程崩溃才需要等 TTL。
+
+        工具调用期间起一个后台心跳，按 ``ttl / 3`` 续租：一次慢调用不该让租约过期，
+        否则接手者会在「这一步还在执行」的时候闯进来。心跳失败只置 ``lost``，不打断
+        正在跑的工具——调用已经发出去了，半途掐断只会留下一个不知道有没有生效的副
+        作用。等它返回，下一次写入由栅栏拒绝，本次结局是 ``LOST``。
     """
 
     def __init__(
@@ -130,6 +203,8 @@ class Engine:
         self._owner = owner
         self._lease_ttl = lease_ttl
         self._lease: Lease | None = None
+        self._lost: BaseException | None = None
+        self._lost_lock = threading.Lock()
 
     def _append(self, run_id: str, type_: EventType, payload: Mapping[str, Any]) -> Event:
         """按当前租约追加事件。
@@ -152,6 +227,9 @@ class Engine:
             租约归还之后再写一律 ``LeaseLost``：那时 ``runs.owner`` 已是空，日志不会
             替你拦，只能由引擎自己守住这条线。
         """
+        if self._lost is not None:
+            # 心跳先发现了失效：即便本地还留着 lease，也已经被别人接管
+            raise LeaseLost(f"{run_id!r} 的租约在调用期间失效：{self._lost}") from self._lost
         if self._owner is not None and self._lease is None:
             raise LeaseLost(f"{run_id!r} 的租约已归还，不能再写")
         if self._lease is None:
@@ -193,6 +271,41 @@ class Engine:
             self._log.release(lease)
         except LeaseLost:
             return
+
+    def _mark_lost(self, error: BaseException) -> None:
+        """记录一次续租失败；此后的一切写入都按 ``LeaseLost`` 处理。
+
+        Args:
+            error: 续租失败的原因。
+
+        Notes:
+            只保留第一次：第一次失败才代表「从这一刻起我不再拥有它」，后面的失败都是
+            同一件事的回声，留着只会让原因越报越偏。
+        """
+        with self._lost_lock:
+            if self._lost is None:
+                self._lost = error
+
+    @contextmanager
+    def _beat(self) -> Iterator[None]:
+        """在长调用期间维持租约；没启用租约时什么也不做。
+
+        Yields:
+            None: 调用方在此期间可以安全地长时间阻塞。
+
+        Notes:
+            心跳只覆盖工具调用，不覆盖整个循环：写事件本身很快，而 ``_append`` 每次
+            写前已经续租，再叠一层心跳只是多一个线程去抢同一把锁。
+        """
+        if self._lease is None:
+            yield
+            return
+        heartbeat = _Heartbeat(self._log, self._lease, self._lease_ttl, self._mark_lost)
+        heartbeat.start()
+        try:
+            yield
+        finally:
+            heartbeat.stop()
 
     def _view(self, run_id: str) -> RunView:
         """从日志重放当前视图。
@@ -340,7 +453,8 @@ class Engine:
             attempt=attempt,
             step_key=make_step_key(run_id, step),
         )
-        outcome = run_tool(tool, args, ctx)
+        with self._beat():
+            outcome = run_tool(tool, args, ctx)
 
         if outcome.status == ToolStatus.SUCCEEDED:
             self._append(

@@ -189,8 +189,14 @@ def test_uncertain_stop_gives_the_lease_back(tmp_path: Path) -> None:
     assert lease.epoch == 2
 
 
-def test_lost_worker_does_not_touch_the_new_owners_lease(tmp_path: Path) -> None:
-    """被接管的 worker 收尾时不能「归还」别人的租约。"""
+def test_lost_worker_does_not_touch_the_new_owners_lease(
+    tmp_path: Path, no_heartbeat: None
+) -> None:
+    """被接管的 worker 收尾时不能「归还」别人的租约。
+
+    Notes:
+        与上面那条同理：接管只在心跳缺席时才可能发生，所以这里也把心跳关掉。
+    """
     log = SqliteEventLog(tmp_path / "events.db")
     tool = TakeoverEcho(log)
     registry = ToolRegistry()
@@ -274,7 +280,13 @@ def test_failing_release_does_not_change_the_result(tmp_path: Path) -> None:
     assert result.stop_reason is StopReason.SUCCEEDED
 
 
-def test_takeover_mid_call_stops_the_old_worker(tmp_path: Path) -> None:
+def test_takeover_mid_call_stops_the_old_worker(tmp_path: Path, no_heartbeat: None) -> None:
+    """心跳缺席时，长时间调用会被接管；接管之后旧 worker 写不进去。
+
+    Notes:
+        心跳开着时这次接管根本不会发生——那正是 19C 要的效果。所以这里显式关掉心跳，
+        验证的是「心跳死了以后怎么办」，而不是默认行为。
+    """
     log = SqliteEventLog(tmp_path / "events.db")
     tool = TakeoverEcho(log)
     registry = ToolRegistry()
