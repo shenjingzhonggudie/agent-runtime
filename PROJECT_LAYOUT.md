@@ -566,7 +566,7 @@ scripts     → engine / policy / llm / journal / ledger_tools / reconcile / dem
 | ruff format | 全仓库 | `.\.venv\Scripts\ruff.exe format --check .` | 通过（54 files） |
 | mypy | `src/agentrun` | `.\.venv\Scripts\python.exe -m mypy` | 通过（15 source files，0 error） |
 | CI | GitHub Actions，ubuntu-latest + Python 3.14 | 同上四条 | **已推送并实跑通过**（run 40189098128） |
-| Docker | `Dockerfile` + `docker-compose.yml`，数据在命名卷 | `docker compose run --rm agentrun --help` | **未在本机实跑**：本机没有 Docker，只核对了入口点、打包元数据与依赖清单 |
+| Docker | `Dockerfile` + `docker-compose.yml`，数据在命名卷 | `docker build` / `docker compose build` / 容器内 `ledger` + `run --policy script` + `verify` | **已实跑通过**（Docker Desktop 4.97.0，Engine 29.9.2，linux/amd64）：非 root `uid=10001`、`/data` 可写、命名卷跨容器持久化、任务 `SUCCEEDED`、`verify` 链完好 |
 
 mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores`、
 `no_implicit_optional`；未开启全局 `strict`，未忽略具体错误码。
@@ -632,7 +632,8 @@ mypy 配置：`disallow_untyped_defs`、`warn_return_any`、`warn_unused_ignores
 | 租约状态只在查看时可见 | `status` 是一次快照，没有「即将过期」的告警通道；过期后也不会自动通知任何人 | 接入运维告警或多任务调度时 |
 | 工具调用没有超时 | 工具卡在死循环或永不返回的等待上时，心跳照常续租，租约不会过期，别人也接不了手——只能靠人杀掉进程、再由 TTL 兜底。给工具加超时会把「没等到结果」记成 `UNCERTAIN`，语义正确，但需要额外线程与分类，19C 明确决定不做 | 出现无人值守的长任务时 |
 | 归还只覆盖「走到 finally」的路径 | 进程在归还前被杀，仍要走 TTL；没有「退出前写遗嘱」这类机制 | 需要更快接管时 |
-| 镜像没有实跑过 | `Dockerfile` / `docker-compose.yml` 只在静态层面核对过（console script 存在、`pip install --dry-run` 能出元数据、依赖清单完整）。本机没有 Docker，构建与运行都未验证；`python:3.14-slim` 是否已有、`pip install` 在容器内能否成功，都要等第一次 build 才知道 | 第一次在有 Docker 的机器上构建时 |
+| 镜像只在单机单架构验证过 | 实跑覆盖的是 Docker Desktop（WSL2 后端）+ `linux/amd64`：构建、非 root 身份、`/data` 权限、命名卷持久化、脚本任务与 `verify` 都过了，但没有 arm64 构建，也没在纯 Docker Engine（无 Desktop）上验证。多架构要 buildx 与额外构建时间 | 发布到 Apple Silicon 或 Linux 服务器时 |
+| 镜像没有健康检查与资源限额 | `Dockerfile` 和 compose 都没有 `HEALTHCHECK`，也没写内存 / CPU 限额；容器跑飞了只能靠外部观察发现 | 长期驻留运行或与他人共享宿主机时 |
 
 ## 9. 未来模块（未创建）
 

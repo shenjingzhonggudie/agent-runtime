@@ -123,6 +123,12 @@ docker compose run --rm agentrun ask "从账户 A 转 250 到账户 B"
 
 容器内工作目录固定 `/data`，所以默认的 `agentrun.db` 与 `ledger/` 都落在卷里，不用每次传路径。想换成宿主机目录，把 `agentrun-data:/data` 换成 `./state:/data`，并把宿主机目录属主改成容器内的 uid `10001`（Windows 的 Docker Desktop 不需要）。
 
+Windows PowerShell 下不需要交互输入时加 `-T`：compose 会跳过申请伪终端，进度信息不再和程序输出抢同一块屏幕。
+
+```powershell
+docker compose run --rm -T agentrun ledger balance
+```
+
 两条限制：
 
 - 多容器共享同一个卷并同时写入时，SQLite 的文件锁只在同一台宿主机、同一文件系统下可靠；NFS / SMB 上不成立。

@@ -178,9 +178,26 @@
   起一个子进程装 setuptools，那个子进程只认环境变量。
 - README 加「在 Docker 里跑」，含构建、初始化、`ask`、`verify` 与两条限制（多容器共享
   卷时 SQLite 锁的边界、镜像不读宿主机配置）。
-- **未验证**：本机没有 Docker，构建与运行都没跑过。已做的静态核对只有三条——
-  console script `agentrun.exe` 存在、`pip install --dry-run --no-deps` 能产出
-  `agentrun-0.1.0.dev0` 元数据、依赖清单与 `requires-python` 完整。债务表已如实记下。
+- **延迟验证 → 已实跑（2026-11-01 晚）**：本机原先没有 Docker，只做过三条静态核对
+  （console script `agentrun.exe` 存在、`pip install --dry-run --no-deps` 能产出
+  `agentrun-0.1.0.dev0` 元数据、依赖清单与 `requires-python` 完整）。装好 Docker Desktop
+  4.97.0（Engine 29.9.2 / linux-amd64）之后补跑，结果：
+
+  | 检查项 | 命令 | 结果 |
+  |---|---|---|
+  | 构建 | `docker build --build-arg PIP_INDEX=<清华源> -t agentrun:0.1.0 .` | 成功，pip 装依赖 44 s（首次拉基础镜像另计） |
+  | compose 构建 | `docker compose build` | 成功，产出 `agentrun:dev` |
+  | 入口点 | `docker run --rm agentrun:0.1.0 --help` | 列出 ask / ledger / run / resume / status / reconcile / resolve / trace / verify |
+  | 运行身份 | `--entrypoint sh -c 'id; touch /data/probe'` | `uid=10001(app)`，`/data` 可写 |
+  | 卷持久化 | `ledger init --A=1000 --B=0` → 换容器 `ledger balance` | 读到 `A: 1000 / B: 0` |
+  | 引擎实跑 | `run --run-id t1 --policy script --script <mount>` | `SUCCEEDED`，2 步（get_balance → transfer） |
+  | 审计 | `verify` | `t1：8 条事件，链完好` |
+  | 副作用 | `ledger balance` | `A: 750 / B: 250` |
+  | 空配置边界 | compose 传入空的 `AGENTRUN_BASE_URL` / `API_KEY` / `MODEL` 后 `ask` | 报「模型配置错误…」，退出码 2，未用空 key 发请求 |
+
+  验证后用 `docker compose down -v` 清掉测试卷与网络，工作区未留脏数据。
+- 仍未覆盖：只验证了 `linux/amd64`，没有 arm64 构建；镜像与 compose 都没有 `HEALTHCHECK`
+  和资源限额。两条都进债务表。
 
 ### 19H｜模型适配层收口（P1，学习者在 2026-10-30 加入 LangChain 之后必做）
 
@@ -270,7 +287,7 @@ LangChain 改造与后续新增事件可能带入新 payload 字段。19B 的 sc
 19H（模型适配收口，越早越好：它决定 19D 与文档口径）
 19C（心跳，独立）    19D（重试，需先回答放哪层）
 19E（文档，可并行）   19I（产品入口，依赖 19H 的文档口径）
-19F 等凭据；19G 不做
+19F 等凭据；19G 已交付（镜像实跑通过）
 ```
 
 ## 不做什么
