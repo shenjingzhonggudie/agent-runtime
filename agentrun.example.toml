@@ -2,5 +2,8 @@
 base_url = "https://api.deepseek.com"
 api_key = "在本地配置中填写自己的密钥"
 model = "deepseek-flash"
-timeout = 60.0
+# timeout 必须小于 CLI 的 --lease-ttl（默认 45 秒）。
+# 工具调用期间有后台心跳按 ttl/3 续租，但模型决策期间没有——
+# 那段时间只靠上一次写事件续的约在撑，超时设大了会以 LeaseLost 收场。
+timeout = 30.0
 reasoning_effort = "none"

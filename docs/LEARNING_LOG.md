@@ -958,7 +958,8 @@
   1. 先写用例再改代码。`test_finished_run_gives_the_lease_back` 与
      `test_uncertain_stop_gives_the_lease_back` 在旧实现下直接红：任务已经
      `SUCCEEDED` / `UNCERTAIN`，另一个 owner 调 `acquire` 仍拿到 `None`。也就是说
-     **干净收尾的任务会被封锁满一个 TTL（默认 30 秒）**，而这段时间里没有任何人在干活。
+     **干净收尾的任务会被封锁满一个 TTL**（当时默认 30 秒，2026-11-04 调为 45，见 D65），
+    而这段时间里没有任何人在干活。
   2. 为什么 302 条用例一条都没抓到？因为租约用例只有三种形状：`owner=None`、同一个
      `Engine` 实例一次跑完、或者专门测"被抢"。从没有"一个 owner 正常结束、另一个
      owner 立刻接手"这一跳。缺口不在代码复杂度，在测试的**边界组合**。

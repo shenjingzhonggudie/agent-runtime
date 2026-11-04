@@ -195,7 +195,7 @@ class Engine:
         log: EventLog,
         *,
         owner: str | None = None,
-        lease_ttl: float = 30.0,
+        lease_ttl: float = 45.0,
     ) -> None:
         self._policy = policy
         self._registry = registry
@@ -262,7 +262,7 @@ class Engine:
             所以这里吞掉 ``LeaseLost``——它只是说明"这本来就是别人的东西"。
 
             进程崩溃时走不到这里，TTL 仍然是唯一的兜底：主动归还与超时接管是两条
-            互补的路径，缺一条就会"干净退出也要等 30 秒"。
+            互补的路径，缺一条就会"干净退出也要等满一个 TTL"。
         """
         lease, self._lease = self._lease, None
         if lease is None:

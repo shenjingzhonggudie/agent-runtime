@@ -508,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     ask_p.add_argument("--max-steps", type=int, default=10)
     ask_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
-    ask_p.add_argument("--lease-ttl", type=float, default=30.0)
+    ask_p.add_argument("--lease-ttl", type=float, default=45.0)
     ask_p.set_defaults(func=cmd_ask)
 
     ledger_p = sub.add_parser("ledger", help="初始化或查看模拟账本")
@@ -534,7 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     run_p.add_argument("--max-steps", type=int, default=10)
     run_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
-    run_p.add_argument("--lease-ttl", type=float, default=30.0)
+    run_p.add_argument("--lease-ttl", type=float, default=45.0)
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser("resume", help="接着上次的进度继续")
@@ -542,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_p.add_argument("--policy", choices=("script", "model"), default="script")
     resume_p.add_argument("--script", type=Path, help="script 模式必需；model 模式从日志恢复")
     resume_p.add_argument("--owner", default=None, help="worker 标识；给出则启用租约与 epoch 栅栏")
-    resume_p.add_argument("--lease-ttl", type=float, default=30.0)
+    resume_p.add_argument("--lease-ttl", type=float, default=45.0)
     resume_p.add_argument("--db", type=Path, default=DEFAULT_DB)
     resume_p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
     resume_p.set_defaults(func=cmd_resume)
