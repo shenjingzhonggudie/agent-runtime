@@ -117,6 +117,48 @@ def test_transfer_rejects_bad_args_without_side_effect(tmp_path, args: dict) -> 
     assert ledger.lookup(CTX.step_key) is None
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"src": "alice", "dst": "unknown-dst", "amount": 250},
+        {"src": "unknown-src", "dst": "bob", "amount": 250},
+    ],
+)
+def test_transfer_rejects_unknown_accounts_without_side_effect(tmp_path, args: dict) -> None:
+    """向/从未知账户转账一律在校验阶段拒绝：账本绝不静默创建账户。
+
+    背景（对抗实验 5.1）：旧行为是 ``balances.get(dst, 0) + amount``，不存在的
+    收款账户会被凭空创建并收到转账，全程无告警。现在这一步在校验阶段就挡住。
+    """
+    ledger = ledger_at(tmp_path)
+    outcome = run_tool(Transfer(ledger), args, CTX)
+
+    assert outcome.status is ToolStatus.FAILED
+    assert outcome.status is not ToolStatus.UNCERTAIN
+    assert outcome.error is not None
+    assert outcome.error["kind"] == "invalid_args"
+    assert "unknown" in outcome.error["message"]
+    # 账本零变化：余额不动、没有新账户、没有记录
+    assert ledger.snapshot() == START
+    assert ledger.lookup(CTX.step_key) is None
+
+
+def test_transfer_allows_zero_balance_existing_account(tmp_path) -> None:
+    """余额为 0 的已登记账户是存在的：bob 初始 0，收钱合法。
+
+    这是与「未知账户」的本质区别：存在性看的是 balances 的键，不是余额。
+    """
+    ledger = ledger_at(tmp_path, initial={"alice": 1000, "bob": 0})
+    outcome = run_tool(
+        Transfer(ledger),
+        {"src": "alice", "dst": "bob", "amount": 250},
+        CTX,
+    )
+
+    assert outcome.status is ToolStatus.SUCCEEDED
+    assert ledger.balance("bob") == 250
+
+
 def test_transfer_business_rejection_is_failed_not_uncertain(tmp_path) -> None:
     ledger = ledger_at(tmp_path, initial={"alice": 500, "bob": 0})
     outcome = run_tool(

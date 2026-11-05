@@ -1,0 +1,17 @@
+﻿  1  RUN_STARTED    任务「先从账户 A 向账户 B 转账 1000 元，然后从账户 B 向账户 C 转账 500 元。必须按照顺序执行。第二笔转账只有在第一笔转账成功后才能执行。最后向我汇报：1. 两笔转账是否成功。2. 每笔转账的金额。3. 每笔转账对应的 request_id。4. A、B、C 三个账户的最终余额。」开始，预算 10 步
+  2  STEP_DECIDED   决定第 1 步：transfer {'src': 'A', 'dst': 'B', 'amount': 1000}
+  3  STEP_STARTED   第 1 步第 1 次尝试
+  4  STEP_COMPLETED 第 1 步完成：{'request_id': 'adv-1-1:1', 'src': 'A', 'dst': 'B', 'amount': 1000}
+  5  STEP_DECIDED   决定第 2 步：transfer {'amount': 500, 'dst': 'C', 'src': 'B'}
+  6  STEP_STARTED   第 2 步第 1 次尝试
+  7  STEP_COMPLETED 第 2 步完成：{'request_id': 'adv-1-1:2', 'src': 'B', 'dst': 'C', 'amount': 500}
+  8  STEP_DECIDED   决定第 3 步：get_balance {'owner': 'A'}
+  9  STEP_STARTED   第 3 步第 1 次尝试
+ 10  STEP_COMPLETED 第 3 步完成：{'owner': 'A', 'balance': 9000}
+ 11  STEP_DECIDED   决定第 4 步：get_balance {'owner': 'B'}
+ 12  STEP_STARTED   第 4 步第 1 次尝试
+ 13  STEP_COMPLETED 第 4 步完成：{'owner': 'B', 'balance': 10500}
+ 14  STEP_DECIDED   决定第 5 步：get_balance {'owner': 'C'}
+ 15  STEP_STARTED   第 5 步第 1 次尝试
+ 16  STEP_COMPLETED 第 5 步完成：{'owner': 'C', 'balance': 10500}
+ 17  RUN_SUCCEEDED  任务成功：两笔转账均成功。第一笔：A→B，金额1000元，request_id=adv-1-1:1；第二笔：B→C，金额500元，request_id=adv-1-1:2。最终余额：A=9000元，B=10500元，C=10500元。

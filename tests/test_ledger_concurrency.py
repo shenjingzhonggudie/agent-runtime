@@ -122,6 +122,13 @@ def test_lock_is_released_when_holder_is_killed(tmp_path: Path) -> None:
 
 
 def test_transfer_tool_maps_busy_to_rejected(tmp_path: Path) -> None:
+    """锁被占用时工具归为 FAILED 且消息说明账本忙，绝不能是 UNCERTAIN。
+
+    历史注记：存在性校验引入后，``validate`` 阶段就会读账本（``has_account``），
+    ``LedgerBusy`` 从校验阶段抛出，按 ``run_tool`` 契约归为 ``validator_crashed``
+    （不再是 run 阶段的 ``rejected``）。两种归类的共同点是：工具确定没有执行，
+    零副作用，都不是 UNCERTAIN。
+    """
     root = tmp_path / "ledger"
     Ledger(root, initial={"A": 1000, "B": 0})
     ready = tmp_path / "ready"
@@ -135,9 +142,11 @@ def test_transfer_tool_maps_busy_to_rejected(tmp_path: Path) -> None:
         holder.communicate()
 
     assert outcome.status is ToolStatus.FAILED
+    assert outcome.status is not ToolStatus.UNCERTAIN
     assert outcome.error is not None
-    assert outcome.error["kind"] == "rejected"
-    assert "账本忙" in str(outcome.error["message"])
+    assert outcome.error["kind"] == "validator_crashed"
+    assert "账本被占用" in str(outcome.error["message"])
+    assert Ledger(root).balance("A") == 1000
 
 
 def test_rejected_tool_exposes_tool_rejected(tmp_path: Path) -> None:

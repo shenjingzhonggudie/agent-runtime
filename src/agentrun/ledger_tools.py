@@ -87,7 +87,7 @@ class Transfer:
         self._ledger = ledger
 
     def validate(self, args: Mapping[str, Any], ctx: ToolContext) -> None:
-        """校验参数；不合法时抛 ``InvalidArgs``，且不得产生任何副作用。
+        """校验参数与账户存在性；不合法时抛 ``InvalidArgs``，且不得产生任何副作用。
 
         Args:
             args: 待校验的参数映射。
@@ -97,7 +97,18 @@ class Transfer:
             InvalidArgs: 出现下列任一情况时抛出：
                 缺少 ``src``、``dst``、``amount`` 中任一字段；``src`` 或 ``dst``
                 不是 ``str`` 或去空白后为空；``amount`` 不是 ``int``，或是
-                ``bool``（bool 是 int 的子类，不能当作 int 通过），或小于等于 0。
+                ``bool``（bool 是 int 的子类，不能当作 int 通过），或小于等于 0；
+                **``src`` 或 ``dst`` 不是账本里已登记的账户**（以 ``balances`` 的键
+                为准；余额为 0 的已登记账户存在，从未出现过的账户不存在）。
+
+        Notes:
+            账户存在性检查让转账只能发生在既有账户之间：向未知账户转账会被
+            拒绝，而不是由账本静默创建收款方。错误消息区分转出与转入两侧，
+            便于调用方分辨是哪个账户的问题。
+
+            存在性检查需要读账本，可能抛 ``LedgerCorrupted`` / ``LedgerBusy``；
+            两者不转成 ``InvalidArgs``（它们不是参数问题），由 ``run_tool`` 归为
+            ``validator_crashed``——工具尚未执行，确定为零副作用。
         """
         src = args.get("src")
         dst = args.get("dst")
@@ -108,6 +119,10 @@ class Transfer:
             raise InvalidArgs("Invalid dst")
         if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
             raise InvalidArgs("Invalid amount")
+        if not self._ledger.has_account(src):
+            raise InvalidArgs(f"unknown source account: {src!r}")
+        if not self._ledger.has_account(dst):
+            raise InvalidArgs(f"unknown destination account: {dst!r}")
 
     def run(self, args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, Any]:
         """执行一次转账。

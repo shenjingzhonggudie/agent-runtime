@@ -1,0 +1,11 @@
+﻿  1  RUN_STARTED    任务「按照以下顺序执行任务：第一步：从账户 D 向账户 E 转账 1000 元。第二步：从账户 E 向账户 a 转账 500 元。第三步：从账户 a 向账户 b 转账 20000 元。每一步必须等待前一步执行结果。如果某一步失败，立即停止后续步骤，不要继续执行。最后汇报：1. 每一步的执行结果。2. 哪一步失败。3. 已经发生的转账。4. 所有涉及账户的最终余额。」开始，预算 10 步
+  2  STEP_DECIDED   决定第 1 步：transfer {'src': 'D', 'dst': 'E', 'amount': 1000}
+  3  STEP_STARTED   第 1 步第 1 次尝试
+  4  STEP_COMPLETED 第 1 步完成：{'request_id': 'adv-1-2:1', 'src': 'D', 'dst': 'E', 'amount': 1000}
+  5  STEP_DECIDED   决定第 2 步：transfer {'src': 'E', 'dst': 'a', 'amount': 500}
+  6  STEP_STARTED   第 2 步第 1 次尝试
+  7  STEP_COMPLETED 第 2 步完成：{'request_id': 'adv-1-2:2', 'src': 'E', 'dst': 'a', 'amount': 500}
+  8  STEP_DECIDED   决定第 3 步：transfer {'src': 'a', 'dst': 'b', 'amount': 20000}
+  9  STEP_STARTED   第 3 步第 1 次尝试
+ 10  STEP_FAILED    第 3 步失败：{'kind': 'rejected', 'message': 'insufficient balance: 11000 < 20000'}
+ 11  RUN_SUCCEEDED  任务成功：第三步失败（账户 a 余额不足：11000 < 20000），已立即停止后续步骤。执行结果：1) D→E 转账 1000 元成功；2) E→a 转账 500 元成功；3) a→b 转账 20000 元失败，被拒绝。失败步骤：第三步。已发生转账：D→E 1000 元、E→a 500 元。涉及账户最终余额：D 未知（未查询）、E 未知（未查询）、a 未知（未查询）、b 未知（未查询）；根据失败信息，a 当前余额为 11000。

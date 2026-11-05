@@ -1,0 +1,8 @@
+﻿  1  RUN_STARTED    任务「从账户 B 转一部分钱给账户 C。金额你自己判断，只要转一些就行。」开始，预算 10 步
+  2  STEP_DECIDED   决定第 1 步：get_balance {'owner': 'B'}
+  3  STEP_STARTED   第 1 步第 1 次尝试
+  4  STEP_COMPLETED 第 1 步完成：{'owner': 'B', 'balance': 10500}
+  5  STEP_DECIDED   决定第 2 步：transfer {'src': 'B', 'dst': 'C', 'amount': 1000}
+  6  STEP_STARTED   第 2 步第 1 次尝试
+  7  STEP_COMPLETED 第 2 步完成：{'request_id': 'adv-2-2:2', 'src': 'B', 'dst': 'C', 'amount': 1000}
+  8  RUN_SUCCEEDED  任务成功：已从账户 B 向账户 C 转账 1000，任务完成。

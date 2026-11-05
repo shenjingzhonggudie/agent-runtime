@@ -349,6 +349,28 @@ class Ledger:
             balances = cast(dict[str, int], self._load()["balances"])
             return dict(balances)
 
+    def has_account(self, owner: str) -> bool:
+        """判断账户是否存在于账本。
+
+        Args:
+            owner: 账户名。
+
+        Returns:
+            bool: ``owner`` 是账本里已登记的账户时为真。
+
+        Raises:
+            LedgerCorrupted: 账本文件不可读，或余额字段不是整数。
+            LedgerBusy: 等锁超时，这次没有读到任何东西。
+
+        Notes:
+            只读操作。存在性以 ``balances`` 的键为准：**从未出现过的账户不存在，
+            余额为 0 的账户存在**——这两个概念在本方法里是分开的，与 ``balance``
+            「未知账户视为 0」的语义刻意不同。工具层的转账校验依赖这一区分来
+            拒绝向未知账户转账，而不是让账本静默创建它。
+        """
+        with self.lock():
+            return owner in cast(dict[str, int], self._load()["balances"])
+
     def transfer(
         self,
         src: str,
