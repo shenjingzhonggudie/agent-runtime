@@ -6,6 +6,10 @@
 
 默认场景为隔离目录中的**模拟账本**（余额查询、非幂等转移、幂等回执、按调用标识对账），不连接任何真实支付、银行或邮件系统。
 
+![AgentRun 全流程路由图](docs/images/architecture.png)
+
+*一页看懂：命令路由、事件契约、主循环与三条恢复路径。文本版（可 diff、随代码更新）见 [`docs/architecture.md`](docs/architecture.md)。*
+
 ## 当前状态
 
 功能已收尾（2026-11-01）：18 轮迭代全部完成，本地 439 个用例、`mypy`、`ruff` 与 CI 全绿，镜像构建与容器内运行已实跑验证，真实模型 8 个场景 8/8 通过。剩下两批（进程内重试、工具调用超时）是明确留给下一版的决定，不是遗漏——边界见下方「边界」。
@@ -58,13 +62,6 @@
 想先看「它到底跑通了什么」，读 [`docs/scenarios.md`](docs/scenarios.md)：8 个真实模型场景的期望结局，以及每个场景对应的离线契约测试。
 
 想先看整体结构，读 [`docs/architecture.md`](docs/architecture.md)：命令路由、事件契约、主循环与三条恢复路径。图是 Mermaid 文本，随代码一起改，不会过时。
-
-<details>
-<summary>整页结构图（点开查看）</summary>
-
-![AgentRun 全流程路由图](docs/images/architecture.png)
-
-</details>
 
 实现契约与接口见 [`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md)，逐轮的取舍与返工见 [`docs/LEARNING_LOG.md`](docs/LEARNING_LOG.md)。
 
