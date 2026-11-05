@@ -59,6 +59,13 @@
 
 想先看整体结构，读 [`docs/architecture.md`](docs/architecture.md)：命令路由、事件契约、主循环与三条恢复路径。图是 Mermaid 文本，随代码一起改，不会过时。
 
+<details>
+<summary>整页结构图（点开查看）</summary>
+
+![AgentRun 全流程路由图](docs/images/architecture.png)
+
+</details>
+
 实现契约与接口见 [`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md)，逐轮的取舍与返工见 [`docs/LEARNING_LOG.md`](docs/LEARNING_LOG.md)。
 
 ## 5 分钟：从空目录到余额变化
