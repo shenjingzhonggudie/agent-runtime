@@ -51,26 +51,64 @@ DEFAULT_LEDGER = Path("ledger")
 LEDGER_TOOL_SPECS = (
     ToolSpec(
         "get_balance",
-        "查询账户余额。参数 owner: str，必需且非空；只读，无业务副作用。"
-        "返回 owner: str、balance: int；未知账户余额为 0。",
+        "查询账户余额。"
+        "参数 owner: str，必需且非空。"
+        "只读，无业务副作用。"
+        "返回 owner: str、balance: int。"
+        "注意：本工具不区分账户是否存在——从未出现过的账户与余额为 0 的已登记账户"
+        "返回相同结果（balance: 0），balance 为 0 不能作为账户不存在或存在的证据。"
+        "账户是否存在，以 transfer 的校验结果为准（不存在会报 unknown account）。",
     ),
     ToolSpec(
         "transfer",
-        "转账。参数 src: str、dst: str，必需且非空；amount: int，必需且大于 0，"
-        "不接受 bool。非幂等写操作，重复调用会重复转账；结果未知时不得自动重做。"
-        "返回 request_id、src、dst、amount；request_id 由引擎生成，无需传入。",
-    ),
-    ToolSpec(
-        "save_receipt",
-        "保存回执。参数 text: str，必需且非空。幂等写操作：同一引擎 step_key "
-        "重复调用只保存首次内容；不同步骤使用不同键。返回 request_id、text；"
+        "执行两个已存在账户之间的资金转账。"
+        "非幂等写操作：重复调用会重复扣款，账本不去重。"
+        "参数 src: str，必需且非空；"
+        "dst: str，必需且非空；"
+        "amount: int，必需且大于 0，不接受 bool。"
+
+        "执行约束："
+        "1. 转出账户和转入账户都必须真实存在。"
+        "2. 不允许自动创建不存在的账户。"
+        "3. 不允许通过转账操作创建账户或初始化账户余额。"
+        "4. 转账金额必须由用户明确指定，不得自行猜测或决定。"
+        "5. 用户只说转一部分、转一些等模糊金额时，必须先询问具体金额。"
+        "6. 必须遵守 Ledger 的最低余额预留规则，不得绕过。"
+        "7. 所有参数和业务条件通过校验后，才能执行资金变更。"
+        "8. 校验失败不得产生任何资金副作用。"
+        "9. 结果未知时不得自动重复执行，应先通过 lookup_request 对账。"
+
+        "返回 request_id、src、dst、amount；"
         "request_id 由引擎生成，无需传入。",
     ),
     ToolSpec(
+        "save_receipt",
+        "保存操作回执。"
+        "参数 text: str，必需且非空。"
+        "只负责保存回执，不执行转账，也不改变账户余额。"
+        "幂等写操作：相同 request_id 重复保存时只保留首次内容。"
+        "不同步骤使用不同的 step_key。"
+        "request_id 由引擎生成，无需传入。"
+        "只有业务流程明确要求保存回执时才调用。",
+    ),
+    ToolSpec(
         "lookup_request",
-        "查询已生效的操作。参数 request_id: str，必需且非空。只读，无业务副作用。"
-        "查到返回 found: true、kind: str、amount: int；未查到返回 found: false，"
-        "不能据此断言操作从未生效。",
+        "根据 request_id 查询账本中已经记录的操作。"
+        "参数 request_id: str，必需且非空。"
+        "只读，无业务副作用。"
+
+        "仅用于核实指定 request_id 对应的操作记录，"
+        "不能用于查询账户余额或查询业务规则。"
+
+        "查询到记录时返回 found: true，以及记录的 kind、"
+        "amount、src、dst 等实际存在的字段。"
+
+        "未查询到记录时返回 found: false。"
+        "本工具只有这两种返回：账本读取失败会以工具错误（FAILED）呈现，"
+        "不会伪装成 found: false，因此 found: false 只表示「账本当前没有这条记录」。"
+
+        "该工具用于 Reconcile 对账，"
+        "不能仅凭未查询到记录就断言外部操作一定没有发生。",
     ),
 )
 
