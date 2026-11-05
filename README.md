@@ -57,6 +57,8 @@
 
 想先看「它到底跑通了什么」，读 [`docs/scenarios.md`](docs/scenarios.md)：8 个真实模型场景的期望结局，以及每个场景对应的离线契约测试。
 
+想先看整体结构，读 [`docs/architecture.md`](docs/architecture.md)：命令路由、事件契约、主循环与三条恢复路径。图是 Mermaid 文本，随代码一起改，不会过时。
+
 实现契约与接口见 [`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md)，逐轮的取舍与返工见 [`docs/LEARNING_LOG.md`](docs/LEARNING_LOG.md)。
 
 ## 5 分钟：从空目录到余额变化
@@ -332,7 +334,8 @@ LangChain/服务对某些模型的温度参数可能有限制；相同提示也�
 src/agentrun/        包本体：账本、事件、折叠、编解码、工具、策略、模型适配器与客户端、日志、引擎、对账、CLI
 tests/               契约测试
 scripts/             教学脚本：崩溃窗口、账本工具、恢复重放、对账续跑、模型策略、人工复核、进程级故障注入、评测集
-docs/                给人读的五份：
+docs/                给人读的六份：
+  architecture.md      一页看懂：命令路由、主循环、三条恢复路径、状态机
   design.md            为什么这样设计：三个选择与各自的代价
   scenarios.md         8 个真实场景的期望结局与证据
   PROJECT_LAYOUT.md    当前契约：接口、不变量、决策与债务

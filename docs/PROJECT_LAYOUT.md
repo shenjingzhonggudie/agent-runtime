@@ -21,7 +21,8 @@ v0 / v1 / v2 的定义见 `LEARNING_LOG.md` 第 0 轮。
 项目2/
 ├─ pyproject.toml            依赖与工具配置唯一来源（pytest / ruff / mypy）
 ├─ README.md                 产品入口：5 分钟跑一遍、能力与边界
-├─ docs/                     给人读的五份（README 留在根目录做门面）
+├─ docs/                     给人读的六份（README 留在根目录做门面）
+│  ├─ architecture.md        一页看懂：命令路由、主循环、恢复路径、状态机
 │  ├─ design.md              为什么这样设计：三个选择与各自的代价
 │  ├─ scenarios.md           8 个真实模型场景的期望结局与证据链
 │  ├─ PROJECT_LAYOUT.md      当前契约：接口、不变量、决策与债务
