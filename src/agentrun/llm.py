@@ -158,6 +158,33 @@ def _excerpt(text: str, limit: int = 80) -> str:
     return flat if len(flat) <= limit else f"{flat[:limit]}…"
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads`` 的 ``object_pairs_hook``：对象里出现同名键即拒绝。
+
+    Args:
+        pairs: 解析器按出现顺序给出的键值对。
+
+    Returns:
+        dict: 无重复键时按原顺序构造的对象。
+
+    Raises:
+        ValueError: 键在同一个对象里出现第二次，消息含重复键名。
+
+    Notes:
+        Python 的 ``json`` 默认把重复键静默合并成后值（RFC 8259 只 SHOULD 唯一，
+        ``JSON.parse``、``encoding/json`` 等主流实现同样取后值）。模型输出里的重复
+        键是「没按约定输出」的信号，静默合并会让一个参数的两个候选值不留痕迹地
+        生效其一，所以在这里显式抛错，由 ``parse_action`` 转成可重试的
+        ``PolicyError``。
+    """
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"重复键：{key!r}")
+        out[key] = value
+    return out
+
+
 def parse_action(text: str) -> Action:
     """把模型输出解析成动作。
 
@@ -168,9 +195,9 @@ def parse_action(text: str) -> Action:
         Action: ``ToolCall`` 或 ``Finish``。
 
     Raises:
-        PolicyError: 输出不是字符串、不是合法 JSON、不是对象、给了未知字段、同时给了
-            ``tool`` 与 ``finish``、两者都没给、工具名不是非空字符串、``args`` 不是
-            映射、``finish`` 不是非空字符串。
+        PolicyError: 输出不是字符串、不是合法 JSON、含重复键、不是对象、给了未知
+            字段、同时给了 ``tool`` 与 ``finish``、两者都没给、工具名不是非空字符串、
+            ``args`` 不是映射、``finish`` 不是非空字符串。
 
     Notes:
         这里的失败一律 ``retryable=True``：原因是「这一次的输出没读懂」，而模型下一
@@ -182,7 +209,9 @@ def parse_action(text: str) -> Action:
         1. 不剥 Markdown 代码块、不截取第一个 ``{`` 到最后一个 ``}``：容错会让「模型
            没按约定输出」变成「有时能跑」，而这种差别在日志里看不出来。
         2. 不把 ``finish`` 的非字符串值转成字符串：``250`` 是参数，不是结论。
-        3. 不校验工具是否存在：那是引擎的事，只有注册表知道答案。
+        3. 不接受重复键：``json.loads`` 默认静默取后值，这里用 ``object_pairs_hook``
+           显式拒绝——重复键属于「模型没按约定输出」，不该无声通过。
+        4. 不校验工具是否存在：那是引擎的事，只有注册表知道答案。
     """
     if not isinstance(text, str):
         raise PolicyError(f"模型输出必须是字符串，收到 {type(text).__name__}", retryable=True)
@@ -191,11 +220,15 @@ def parse_action(text: str) -> Action:
         raise PolicyError("模型输出为空", retryable=True)
 
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise PolicyError(
             f"模型输出不是合法 JSON：{exc.msg}：{_excerpt(raw)}", retryable=True
         ) from exc
+    except ValueError as exc:
+        # object_pairs_hook 抛出的重复键信号。JSONDecodeError 是 ValueError 的子类，
+        # 但只可能来自解析器本体；hook 抛的裸 ValueError 落到这里。
+        raise PolicyError(f"模型输出含重复键：{exc}：{_excerpt(raw)}", retryable=True) from None
 
     if not isinstance(data, dict):
         raise PolicyError(f"模型输出必须是 JSON 对象，收到 {type(data).__name__}", retryable=True)

@@ -193,12 +193,41 @@ def test_parse_strips_surrounding_whitespace() -> None:
         '{"tool": "get_balance", "extra": 1}',
         '{"finish": ""}',
         '{"finish": 250}',
+        # 重复键：json.loads 默认静默取后值，这里必须显式拒绝（参数级 + 顶层级）
+        '{"tool": "transfer", "args": {"src": "A", "dst": "B", "amount": 100, "amount": 1000}}',
+        '{"tool": "transfer", "tool": "get_balance", "args": {}}',
+        '{"finish": "完成", "finish": "再完成"}',
         '```json\n{"tool": "get_balance"}\n```',
     ],
 )
 def test_reject_invalid_output(text: str) -> None:
     with pytest.raises(PolicyError):
         parse_action(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # args 内的重复参数：静默取后值会让模型的真实意图无法判定
+        '{"tool": "transfer", "args": {"src": "A", "amount": 100, "amount": 1000}}',
+        # 嵌套对象里的重复键：hook 对每一层对象生效
+        '{"tool": "transfer", "args": {"src": "A", "meta": {"k": 1, "k": 2}}}',
+        # 顶层的重复字段
+        '{"tool": "transfer", "tool": "get_balance", "args": {}}',
+    ],
+)
+def test_duplicate_keys_are_rejected_not_merged(text: str) -> None:
+    """重复键必须显式失败，而不是静默取后值。
+
+    背景：Python ``json.loads`` 对 ``{"amount": 100, "amount": 1000}`` 不报错、
+    直接得到 ``amount=1000``（RFC 8259 对重复键只有 SHOULD）。模型输出出现重复
+    键是「没按约定输出」，静默合并会让一个参数的两个候选值不留痕迹地生效其一。
+    """
+    with pytest.raises(PolicyError, match="重复键") as exc_info:
+        parse_action(text)
+
+    # 归类为「这一次的输出没读懂」：可重试，模型下一次大概率能修正
+    assert exc_info.value.retryable is True
 
 
 def test_non_str_output_is_rejected() -> None:
