@@ -20,3 +20,6 @@ tmp/
 
 # 本机模型凭据，不提交到版本控制
 agentrun.local.toml
+
+# 个人资料（面试材料等）不放仓库
+docs/images/*.pdf
