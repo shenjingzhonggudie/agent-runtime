@@ -1,6 +1,7 @@
 # Agent 任务执行引擎（agentrun）
 
 [![CI](https://github.com/shenjingzhonggudie/agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/shenjingzhonggudie/agent-runtime/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 以持久化事件为事实来源、根据工具反馈决定下一步动作、并能在明确安全边界内恢复的轻量 Agent 执行引擎。
 
